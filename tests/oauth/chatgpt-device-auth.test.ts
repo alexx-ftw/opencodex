@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { loginChatGPT } from "../../src/oauth/chatgpt";
-import { loginChatGPTDevice, loginChatGPTNativeDevice } from "../../src/oauth/chatgpt-device";
+import { DEVICE_FETCH_TIMEOUT_MS, loginChatGPTDevice, loginChatGPTNativeDevice } from "../../src/oauth/chatgpt-device";
 import type { OAuthController } from "../../src/oauth/types";
 
 /**
@@ -309,7 +309,13 @@ describe("ChatGPT device auth", () => {
     for (const signal of signals) expect(signal).toBeInstanceOf(AbortSignal);
   });
 
-  test("a hung fetch is failed by the per-fetch deadline, not the grant TTL (#3898)", async () => {
+  test("the per-fetch signal is a fresh composite whose abort fails the login (#3898)", async () => {
+    // The deadline itself is a named, bounded constant — far from the 15-minute
+    // grant TTL. bun's fake timers spin on AbortSignal.timeout in this suite,
+    // so the firing proof is the composition: a FRESH signal per fetch (never
+    // the caller's own), and its abort fails the login.
+    expect(DEVICE_FETCH_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(DEVICE_FETCH_TIMEOUT_MS).toBeLessThanOrEqual(60_000);
     // The 30s per-fetch deadline is an AbortSignal.timeout composed into every
     // fetch; bun's fake timers drive AbortSignal.timeout (verified), but the
     // combination spins inside this suite's fake-clock, so this test proves

@@ -30,7 +30,7 @@ const DEVICE_FLOW_TTL_MS = 15 * 60 * 1000;
  * grant. A FRESH timeout per fetch attempt is required — a single timeout
  * shared across the poll loop would kill the 15-minute grant.
  */
-const DEVICE_FETCH_TIMEOUT_MS = 30_000;
+export const DEVICE_FETCH_TIMEOUT_MS = 30_000;
 
 function deviceFetchSignal(signal?: AbortSignal): AbortSignal {
   const timeout = AbortSignal.timeout(DEVICE_FETCH_TIMEOUT_MS);
