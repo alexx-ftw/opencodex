@@ -96,6 +96,11 @@ export const MANAGEMENT_ROUTES: readonly ManagementRoute[] = [
   { method: "POST", path: "/api/codex-auth/accounts", module: "codex/auth-api", mutates: true },
   { method: "POST", path: "/api/codex-auth/accounts/clear-cooldown", module: "codex/auth-api", mutates: true },
   { method: "POST", path: "/api/codex-auth/accounts/refresh", module: "codex/auth-api", mutates: true },
+  // codex/main-device-reauth-api (#3898): the native-main device reauth namespace;
+  // /api/codex-auth/login stays pool-only and keeps rejecting __main__.
+  { method: "POST", path: "/api/codex-auth/main/reauth-device", module: "codex/main-device-reauth-api", mutates: true },
+  { method: "GET", path: "/api/codex-auth/main/reauth-device", module: "codex/main-device-reauth-api", mutates: false },
+  { method: "DELETE", path: "/api/codex-auth/main/reauth-device", module: "codex/main-device-reauth-api", mutates: true },
   { method: "POST", path: "/api/codex-auth/login", module: "codex/auth-api", mutates: true },
   { method: "POST", path: "/api/codex-auth/login/cancel", module: "codex/auth-api", mutates: true },
   { method: "POST", path: "/api/codex-auth/login/code", module: "codex/auth-api", mutates: true },

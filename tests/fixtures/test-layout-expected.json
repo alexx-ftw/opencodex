@@ -1203,5 +1203,7 @@
   "zz-pr-coderabbit-readiness-revalidation.test.ts": "ci-workflows",
   "devin-cli-login.test.ts": "providers",
   "devin-cli-authmode-migration.test.ts": "providers",
-  "usage-log-ws-stage.test.ts": "usage"
+  "usage-log-ws-stage.test.ts": "usage",
+  "main-device-reauth.test.ts": "codex-integration",
+  "main-device-reauth-api.test.ts": "codex-integration"
 }

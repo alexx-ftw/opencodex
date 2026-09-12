@@ -388,6 +388,13 @@ export async function handleManagementAPI(
   }
 
   if (url.pathname.startsWith("/api/codex-auth/")) {
+    // Native-main device reauth (#3898): a dedicated namespace the generic
+    // codex-auth dispatch must not swallow (it would 404 as an unknown pool
+    // route). Same management origin/auth/session wrapping as every /api/*.
+    if (url.pathname === "/api/codex-auth/main/reauth-device") {
+      const { handleMainDeviceReauthAPI } = await import("../codex/main-device-reauth-api");
+      return handleMainDeviceReauthAPI(req, url, config);
+    }
     const { handleCodexAuthAPI } = await import("../codex/auth-api");
     const { ConfigMutationLockError } = await import("../config");
     const { CodexCredentialRefreshLockTimeoutError } = await import("../codex/account-store");
