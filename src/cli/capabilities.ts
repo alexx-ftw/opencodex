@@ -236,6 +236,28 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["account", "main", "reauth"],
+    summary: "Reauthenticate the native main Codex login with a device code (#3898); headless hubs need no Codex App or keyring.",
+    routes: [
+      { method: "POST", path: "/api/codex-auth/main/reauth-device" },
+      { method: "GET", path: "/api/codex-auth/main/reauth-device" },
+      { method: "DELETE", path: "/api/codex-auth/main/reauth-device" },
+    ],
+    flags: [
+      { name: "--device", value: "boolean", summary: "Run the device-code flow (the only reauth mode)." },
+      { name: "--no-wait", value: "boolean", summary: "Print the flow handle and code without waiting for completion." },
+      { name: "--flow", value: "string", summary: "Flow id for status and cancel." },
+      { name: "--json", value: "boolean", summary: "Emit the flow status as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: [
+      "Same-identity reauth only: the device login must complete for the ChatGPT account that already holds the native main slot, and the commit is fenced by the exclusive claim plus a path/hash/inode snapshot.",
+      "/api/codex-auth/login stays pool-only and keeps rejecting __main__; this namespace is the only device-reauth surface for the native main slot.",
+      "Payloads carry only flowId, status, the verification URL, the device code, and a closed set of failure codes -- never tokens, emails, or raw account ids.",
+    ],
+  },
+  {
     command: ["account", "list"],
     summary: "Codex OAuth accounts with pool priority and pause state.",
     routes: [{ method: "GET", path: "/api/codex-auth/accounts" }],

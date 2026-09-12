@@ -486,6 +486,9 @@ ocx account main doctor [--json]
 ocx account main list [--json]
 ocx account main register <label> [--json]
 ocx account main add <label>
+ocx account main reauth --device [--no-wait] [--json]
+ocx account main reauth status --flow <id> [--json]
+ocx account main reauth cancel --flow <id> [--json]
 ocx account main switch <profile-id-or-label> --yes [--json]
 ocx account main recover [--rollback --yes] [--json]
 ```
@@ -500,6 +503,8 @@ login flow before importing the resulting credential. Close Codex before switchi
 successful switch preserves local tasks and history, then requires Codex to be restarted. Use
 `doctor` to inspect profile state and `recover` to finish or roll back an interrupted transition.
 `switch` accepts either the profile ID or its label.
+
+`reauth` re-authenticates the *existing* native main identity with an OpenAI device code (#3898) instead of enrolling a new profile. It is the headless-hub recovery path: no local Codex App, no `codex` binary, and no OS keyring are required. The device login must complete for the same ChatGPT account that already holds the native main slot; the credential write is fenced by the exclusive claim and a path/hash/inode snapshot, and the command output carries only the flow id, the verification URL, the device code, and status. The pool login route stays pool-only and keeps rejecting `__main__`; the equivalent dashboard surface is the Codex Auth main card's Re-login with device code control.
 
 The v1 recovery matrix covers an OpenCodex process exiting after a transaction file has been
 published by rename. It does not claim durability across an OS or kernel crash or sudden power

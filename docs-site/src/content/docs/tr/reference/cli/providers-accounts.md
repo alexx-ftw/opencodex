@@ -360,6 +360,9 @@ ocx account main doctor [--json]
 ocx account main list [--json]
 ocx account main register <etiket> [--json]
 ocx account main add <etiket>
+ocx account main reauth --device [--no-wait] [--json]
+ocx account main reauth status --flow <id> [--json]
+ocx account main reauth cancel --flow <id> [--json]
 ocx account main switch <profil-id-veya-etiket> --yes [--json]
 ocx account main recover [--rollback --yes] [--json]
 ```

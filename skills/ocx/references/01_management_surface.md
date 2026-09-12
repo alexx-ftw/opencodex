@@ -455,6 +455,29 @@ JSON mode: `payload`.
 - `store` verifies every keychain write by read-back before config.json is rewritten with keychain: references; an unavailable keychain refuses with 503 and leaves the file untouched.
 - Headless services usually have no unlocked keychain session; prefer ${ENV_VAR} references there.
 
+### `ocx account main reauth`
+
+Reauthenticate the native main Codex login with a device code (#3898); headless hubs need no Codex App or keyring.
+
+| Method | Route |
+|---|---|
+| POST | `/api/codex-auth/main/reauth-device` |
+| GET | `/api/codex-auth/main/reauth-device` |
+| DELETE | `/api/codex-auth/main/reauth-device` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--device` | boolean | Run the device-code flow (the only reauth mode). |
+| `--no-wait` | boolean | Print the flow handle and code without waiting for completion. |
+| `--flow` | string | Flow id for status and cancel. |
+| `--json` | boolean | Emit the flow status as JSON. |
+
+JSON mode: `payload`.
+
+- Same-identity reauth only: the device login must complete for the ChatGPT account that already holds the native main slot, and the commit is fenced by the exclusive claim plus a path/hash/inode snapshot.
+- /api/codex-auth/login stays pool-only and keeps rejecting __main__; this namespace is the only device-reauth surface for the native main slot.
+- Payloads carry only flowId, status, the verification URL, the device code, and a closed set of failure codes -- never tokens, emails, or raw account ids.
+
 ### `ocx account refresh`
 
 Refresh account quotas without model validation; pending Codex accounts require dashboard consent.
@@ -769,6 +792,6 @@ JSON mode: `payload`.
 
 ## Counts
 
-- declared capabilities: 41
-- of those, state-changing: 20
+- declared capabilities: 42
+- of those, state-changing: 21
 - head-resolved invocations: 2
