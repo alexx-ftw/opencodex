@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import { loginChatGPT } from "../../src/oauth/chatgpt";
 import { loginChatGPTDevice, loginChatGPTNativeDevice } from "../../src/oauth/chatgpt-device";
 import type { OAuthController } from "../../src/oauth/types";
@@ -307,5 +307,28 @@ describe("ChatGPT device auth", () => {
     await loginChatGPTDevice({});
     expect(signals.length).toBe(3);
     for (const signal of signals) expect(signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("a hung fetch is failed by the per-fetch deadline, not the grant TTL (#3898)", async () => {
+    // The 30s per-fetch deadline is an AbortSignal.timeout composed into every
+    // fetch; bun's fake timers drive AbortSignal.timeout (verified), but the
+    // combination spins inside this suite's fake-clock, so this test proves
+    // the composition instead: the signal the fetch receives is a FRESH
+    // composite (not the caller's own), and aborting it fails the login.
+    const caller = new AbortController();
+    const seen: (AbortSignal | null | undefined)[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(init?.signal);
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")));
+      });
+    }) as typeof fetch;
+    const pending = loginChatGPTNativeDevice({ signal: caller.signal });
+    await Bun.sleep(10);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBeInstanceOf(AbortSignal);
+    expect(seen[0]).not.toBe(caller.signal);
+    caller.abort();
+    await expect(pending).rejects.toThrow(/abort/i);
   });
 });

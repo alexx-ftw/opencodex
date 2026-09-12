@@ -54,7 +54,7 @@ interface ActiveFlow {
   /** Set once auth.json has been replaced; cancellation can no longer win. */
   published: boolean;
   /** Snapshot-holding commit prepared at start; closure-private identity. */
-  prepared: { commit: (tokens: NativeMainReauthTokens) => Promise<{ chatgptAccountId: string }> };
+  prepared?: { commit: (tokens: NativeMainReauthTokens) => Promise<{ chatgptAccountId: string }> };
 }
 
 /** Bounded terminal retention so status/cancel stay answerable after completion. */
@@ -125,19 +125,26 @@ export function startMainDeviceReauth(deps: MainDeviceReauthDeps = {}): MainDevi
   const now = (deps.now ?? Date.now)();
   sweepTerminal(now);
   if (activeFlow && !isTerminal(activeFlow.status)) throw new MainDeviceReauthFlowBusyError();
-  // Prepare NOW: the existing credential snapshot is captured at start (080),
-  // so a hub with no reauthenticatable main credential fails fast with
-  // native_main_unavailable instead of after the human completes the page.
-  const prepared = (deps.beginCommit ?? beginNativeMainReauth)();
   const flowId = (deps.flowId ?? randomUUID)();
   const flow: ActiveFlow = {
     flowId,
     controller: new AbortController(),
     status: { flowId, status: "pending", verificationUrl: "", deviceCode: "" },
     published: false,
-    prepared,
   };
+  // Claim the singleflight slot BEFORE preparing: two overlapping starts must
+  // not both snapshot and then have one throw flow_in_progress after the
+  // other already began polling.
   activeFlow = flow;
+  try {
+    // Prepare NOW: the existing credential snapshot is captured at start (080),
+    // so a hub with no reauthenticatable main credential fails fast with
+    // native_main_unavailable instead of after the human completes the page.
+    flow.prepared = (deps.beginCommit ?? beginNativeMainReauth)();
+  } catch (error) {
+    activeFlow = null;
+    throw error;
+  }
   const login = deps.login ?? loginChatGPTNativeDevice;
   const clock = deps.now ?? Date.now;
   void (async () => {
@@ -157,7 +164,11 @@ export function startMainDeviceReauth(deps: MainDeviceReauthDeps = {}): MainDevi
       });
       if (flow.controller.signal.aborted) return;
       if (!isTerminal(flow.status)) flow.status = { flowId, status: "committing" };
-      await flow.prepared.commit({
+      // Recheck immediately before the write: a cancel that landed while the
+      // grant was resolving must not reach auth.json. Once the commit DOES
+      // publish, the terminal is succeeded even if a cancel raced it (080).
+      if (activeFlow !== flow || flow.controller.signal.aborted || isTerminal(flow.status)) return;
+      await flow.prepared!.commit({
         accessToken: grant.credential.access,
         refreshToken: grant.credential.refresh,
         idToken: grant.idToken,

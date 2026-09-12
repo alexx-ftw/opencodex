@@ -116,6 +116,46 @@ describe("native main device reauth flow (#3898)", () => {
     expect(commitCalled).toBe(false);
   });
 
+  test("a cancel landing as the grant resolves skips the commit entirely", async () => {
+    let commitCalled = false;
+    const started = startMainDeviceReauth({
+      flowId: () => "flow-cancel-at-resolve",
+      login: loginStub(async () => {
+        // The cancel lands after the grant exists but before the commit
+        // window: the write must not happen.
+        cancelMainDeviceReauth("flow-cancel-at-resolve");
+        return grant();
+      }),
+      beginCommit: () => ({
+        commit: async () => { commitCalled = true; return { chatgptAccountId: "acct-main-1" }; },
+      }),
+    });
+    await Bun.sleep(20);
+    expect(getMainDeviceReauthStatus(started.flowId)).toMatchObject({ status: "cancelled" });
+    expect(commitCalled).toBe(false);
+  });
+
+  test("a commit already in flight publishes; the cancel loses", async () => {
+    let releaseCommit!: () => void;
+    const commitGate = new Promise<void>(resolve => { releaseCommit = resolve; });
+    const started = startMainDeviceReauth({
+      login: loginStub(async () => grant()),
+      beginCommit: () => ({
+        commit: async () => { await commitGate; return { chatgptAccountId: "acct-main-1" }; },
+      }),
+    });
+    // Wait until the flow is committing, then cancel; the publication wins.
+    const deadline = Date.now() + 2_000;
+    while (getMainDeviceReauthStatus(started.flowId)?.status !== "committing") {
+      if (Date.now() > deadline) throw new Error("flow never reached committing");
+      await Bun.sleep(5);
+    }
+    cancelMainDeviceReauth(started.flowId);
+    releaseCommit();
+    const terminal = await waitForTerminal(started.flowId);
+    expect(terminal).toMatchObject({ status: "succeeded", credentialUpdated: true });
+  });
+
   test("cancellation after publication returns succeeded, never cancelled", async () => {
     const started = startMainDeviceReauth({
       login: loginStub(async ctrl => {

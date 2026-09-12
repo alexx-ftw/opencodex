@@ -21,6 +21,7 @@ import { clearAccountNeedsReauth } from "./account-runtime-state";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import { withNativeMainExclusiveClaim } from "./native-main-claim";
 import { resolveNativeProfileContext } from "./native-profile-store";
+import { isNativeMainTrafficBlocked } from "./native-profile-startup";
 
 export { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 
@@ -312,11 +313,20 @@ export function beginNativeMainReauth(): {
         throw new NativeMainReauthIdentityMismatchError();
       }
       return withNativeMainExclusiveClaim(resolveNativeProfileContext(), async () => {
+        // Recovery/admission recheck (080): a recovery-blocked or not-ready
+        // home fails native_main_unavailable rather than rewriting auth.json
+        // underneath the gate. The claim waits bounded like the refresh path
+        // (30s) so a busy claim is not an instant refusal.
+        if (isNativeMainTrafficBlocked()) {
+          throw new NativeMainReauthUnavailableError(
+            "Native main traffic is blocked by startup or recovery state",
+          );
+        }
         assertMainAuthJsonSnapshotUnchanged(expected);
         persistNativeMainReauthTokens(expected, tokens);
         clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
         return { chatgptAccountId: tokens.chatgptAccountId };
-      });
+      }, { waitMs: 30_000 });
     },
   };
 }
