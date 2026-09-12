@@ -31,6 +31,13 @@ MODIFY `src/oauth/chatgpt-device.ts`
   poll deadline and abort. Add a service-owned per-fetch deadline (fetch +
   body) so a stuck TCP cannot hold the flow until TTL. This is the Kuhn
   blocker "poll timer does not bound fetch/body deadlines".
+  Audit-folded: one FRESH 30s timeout per fetch attempt inside the poll
+  loop (AbortSignal.any([ctrl.signal, AbortSignal.timeout(30_000)]), the
+  main-account.ts:239-241 pattern) — a single 30s signal across the whole
+  poll would kill the 15-minute grant. Abort-timeout maps to
+  device_authorization_failed. The shared helper also bounds hung POOL
+  device logins at 30s per fetch — an intended improvement, called out in
+  the PR.
 
 MODIFY `src/codex/main-account.ts`
 - New `beginNativeMainReauth`: captures the existing
@@ -43,6 +50,13 @@ MODIFY `src/codex/main-account.ts`
   together, advances the mutation epoch, and reconciles runtime/quota
   state. Old identity token is never retained beside new credentials. No
   claim held during human polling.
+  Audit-folded: do NOT reuse persistRefreshedMainAuthJson (:190-195) — it
+  spreads expected.tokens and never writes id_token, so the old identity
+  token would survive beside the new grant. The commit uses a SIBLING
+  persist that sets access_token/refresh_token/id_token/account_id
+  together and overwrites any prior id_token (adding the key is safe:
+  readMainAuthJsonCredential :122 tolerates it and
+  native-profile-store.ts:476-481 expects it).
 
 NEW `src/codex/main-device-reauth.ts`
 - One process-owned active flow (opaque UUID, AbortController, bounded
@@ -68,6 +82,12 @@ MODIFY `src/cli/account-main.ts`
   management API; reject extra args before start. Register capability/help;
   regenerate skill surface with `bun run skill:surface` if the capability
   registry changes (tests/ci-workflows/skill-ocx.test.ts gates this).
+  Audit-folded: the native-main CLI branch point is account-main.ts (:181
+  region, beside add/switch) with USAGE in src/cli/account.ts:64; the
+  management route-registry (src/server/management/route-registry.ts
+  MANAGEMENT_ROUTES) must gain the POST/GET/DELETE rows or
+  management-route-registry.test.ts and the capabilities ratchet go red —
+  do NOT grow UNDECLARED_ROUTES_2026_08_28.
 
 ## Hub fence resolution (open decision 1, resolved here for audit)
 
@@ -103,8 +123,11 @@ contract: strict keys, 400/404/409 shapes, unauthorized rejected,
 `__main__` still refused by `/api/codex-auth/login`.
 MODIFY `tests/oauth/chatgpt-device-auth.test.ts` — native result retains
 idToken in-process; per-fetch deadline fires on a hung stub fetch.
-MODIFY `tests/cli/cli-account.test.ts` — reauth --device surface, status,
-cancel, arg rejection.
+Audit-folded: native-main CLI tests land in
+tests/cli/cli-native-profile.test.ts (native-main CLI); the pool
+cli-account.test.ts keeps only the __main__ login rejection cases.
+MODIFY `tests/cli/cli-native-profile.test.ts` — reauth --device surface,
+status, cancel, arg rejection.
 All NEW files: layout.json explicit + expected-fixture entries.
 
 ## Docs / ownership
