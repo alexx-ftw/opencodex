@@ -22,6 +22,7 @@ export {
 export {
   advanceComboAfterFailure,
   clearComboSelectionState,
+  describeComboUnavailability,
   NoAvailableComboTargetsError,
   noteComboFailure,
   noteComboSuccess,
@@ -34,6 +35,7 @@ export {
   type QuotaInactiveReason,
 } from "./resolve";
 export {
+  clearComboCooldownsForProviders,
   clearComboTargetCooldowns,
   comboCooldownRetryAfterSeconds,
   COMBO_REQUEST_RATE_COOLDOWN_MS,

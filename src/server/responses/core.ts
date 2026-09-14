@@ -84,6 +84,7 @@ import {
   comboIdFromRawBody,
   comboRequestHasImageInput,
   concreteComboRequestBody,
+  describeComboUnavailability,
   getCombo,
   resolveComboId,
   isComboTargetInCooldown,
@@ -1707,8 +1708,11 @@ export function comboUnavailableResponse(
   );
 }
 
-function comboUnavailable(comboId: string, now = Date.now()): Response {
-  return comboUnavailableResponse(`No available targets for combo: ${comboId}`, {
+function comboUnavailable(comboId: string, config: OcxConfig, now = Date.now()): Response {
+  // Per-target reasons in the body: a cooldown, a stale exhausted-quota cache, and a
+  // disabled provider all look identical as a bare 503 otherwise.
+  const reasons = describeComboUnavailability(config, comboId, now);
+  return comboUnavailableResponse(`No available targets for combo: ${comboId}${reasons ? ` (${reasons})` : ""}`, {
     retryAfter: comboCooldownRetryAfterSeconds(comboId, now),
   });
 }
@@ -2896,7 +2900,7 @@ export async function handleComboResponses(
       );
       return options.abortSignal?.aborted
         ? clientCancelledResponse()
-        : comboUnavailable(comboId);
+        : comboUnavailable(comboId, config);
     }
     if (!(await recoverUnreadableEncryptedTask())) {
       return options.abortSignal?.aborted
@@ -2908,7 +2912,7 @@ export async function handleComboResponses(
   if (!pick) {
     return options.abortSignal?.aborted
       ? clientCancelledResponse()
-      : comboUnavailable(comboId);
+      : comboUnavailable(comboId, config);
   }
   // One immutable combo selection trace, before any child dispatch; child
   // adoption below must never replace it with a concrete child route trace.
@@ -3661,7 +3665,7 @@ async function handleResponsesInner(
     logCtx.routeDecision = route.routeDecision;
   } catch (err) {
     if (err instanceof NoAvailableComboTargetsError) {
-      return comboUnavailable(err.comboId);
+      return comboUnavailable(err.comboId, config);
     }
     if (err instanceof NoEligiblePolicyCandidateError) {
       // Persist the evaluation trace (per-candidate exclusions + the
@@ -3773,7 +3777,7 @@ async function handleResponsesInner(
         logCtx.routeDecision = route.routeDecision;
       } catch (err) {
         if (err instanceof NoAvailableComboTargetsError) {
-          return comboUnavailable(err.comboId);
+          return comboUnavailable(err.comboId, config);
         }
         if (err instanceof NoEligiblePolicyCandidateError) {
           logCtx.routeDecision = err.trace;
@@ -3919,7 +3923,7 @@ async function handleResponsesInner(
               logCtx.routeDecision = route.routeDecision;
             } catch (err) {
               if (err instanceof NoAvailableComboTargetsError) {
-                return comboUnavailable(err.comboId);
+                return comboUnavailable(err.comboId, config);
               }
               if (err instanceof NoEligiblePolicyCandidateError) {
                 logCtx.routeDecision = err.trace;

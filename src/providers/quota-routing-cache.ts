@@ -4,6 +4,8 @@ import type { ProviderQuota, ProviderQuotaReport } from "./quota";
 import { providerUsesKeyAuthOverride, resolveProviderApiKey } from "./key-store";
 import { getProviderRegistryEntry } from "./registry";
 import { PROVIDER_QUOTA_MAX_AGE_MS } from "./quota-types";
+import { cachedProviderQuotaIsExhausted } from "../combos/quota-exhaustion";
+import { clearComboCooldownsForProviders } from "../combos/failover";
 
 export interface ProviderQuotaRoutingEvidence {
   quota: ProviderQuota;
@@ -50,6 +52,14 @@ export function replaceCachedProviderQuotas(
   for (const report of reports) {
     quotaCache.set(report.provider, { quota: report.quota, routing: routingEvidence?.get(report) });
   }
+  // Recovery evidence: a fresh, non-exhausted snapshot means the window a combo cooldown
+  // was waiting out has been reset (provider-side, or manually outside OpenCodex). Lift
+  // those cooldowns so combos re-evaluate immediately instead of answering 503 until each
+  // cooldown's own expiry.
+  const recovered = reports
+    .filter(report => !cachedProviderQuotaIsExhausted(report.quota))
+    .map(report => report.provider);
+  if (recovered.length > 0) clearComboCooldownsForProviders(recovered);
 }
 
 export function getCachedProviderQuota(

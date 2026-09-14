@@ -17,6 +17,8 @@ import { resolveProviderApiKey } from "./key-store";
 import { getValidAccessToken, getValidAccessTokenForAccount } from "../oauth";
 import { getAccountCredential, getAccountSet, getCredential } from "../oauth/store";
 import { getConfigDir } from "../config/paths";
+import { cachedProviderQuotaIsExhausted } from "../combos/quota-exhaustion";
+import { clearComboCooldownsForProviders } from "../combos/failover";
 import { antigravityUserAgent } from "../adapters/client-fingerprint";
 import { isCanonicalOllamaCloudUrl } from "../adapters/ollama-native-url";
 import { providerOutboundPost, providerRedirectError, type ProviderOutboundDependencies } from "../lib/provider-outbound";
@@ -2263,6 +2265,14 @@ async function fetchAccountQuota(
         // superseded config generation must not publish either half.
         if (provider === "kiro") commitKiroAccountUsageState(key, kiroSnapshot);
         sweepExpiredOnWrite(entry.ts);
+        // Recovery evidence for combo cooldowns: a fresh per-account probe that shows
+        // headroom means any cooldown waiting out this provider's old exhausted window
+        // (reset provider-side, or manually outside OpenCodex) is stale. Without this
+        // a manual quota refresh leaves combos 503-ing "no available targets" until
+        // each cooldown expires on its own clock.
+        if (entry.quota && !cachedProviderQuotaIsExhausted(entry.quota)) {
+          clearComboCooldownsForProviders([provider], entry.ts);
+        }
       }
       return entry;
     } catch {

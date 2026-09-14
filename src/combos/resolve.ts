@@ -1,6 +1,5 @@
 import type { OcxComboTarget, OcxConfig } from "../types";
 import { getCachedProviderRoutingQuota } from "../providers/quota-routing-cache";
-import type { ProviderQuota } from "../providers/quota-types";
 import { sleepWithAbort } from "../lib/upstream-retry";
 import {
   coolComboTarget,
@@ -67,27 +66,9 @@ function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: 
   return !cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now);
 }
 
-function quotaWindowExhausted(percent: number | undefined, resetAt: number | undefined, now: number): boolean {
-  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 100) return false;
-  return typeof resetAt !== "number" || !Number.isFinite(resetAt) || resetAt > now;
-}
+import { cachedProviderQuotaIsExhausted } from "./quota-exhaustion";
 
-export function cachedProviderQuotaIsExhausted(
-  quota: ProviderQuota | null,
-  now = Date.now(),
-): boolean {
-  if (!quota) return false;
-  if (quotaWindowExhausted(quota.fiveHourPercent, quota.fiveHourResetAt, now)) return true;
-  if (quotaWindowExhausted(quota.weeklyPercent, quota.weeklyResetAt, now)) return true;
-  if (quotaWindowExhausted(quota.monthlyPercent, quota.monthlyResetAt, now)) return true;
-  if (quota.customWindows?.some(window => quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
-  if (quota.creditsUsd?.unlimited !== true
-      && typeof quota.creditsUsd?.percent === "number"
-      && Number.isFinite(quota.creditsUsd.percent)
-      && quota.creditsUsd.percent >= 100
-      && quota.creditsUsd.remaining <= 0) return true;
-  return false;
-}
+export { cachedProviderQuotaIsExhausted };
 
 /**
  * Why a catalog row is offered but cannot currently serve a request (#1711).
@@ -470,4 +451,43 @@ export function tryPickComboModel(config: OcxConfig, modelId: string): ComboPick
   const picked = pickComboTarget(config, comboId);
   if (!picked) throw new NoAvailableComboTargetsError(comboId);
   return picked;
+}
+
+/**
+ * Per-target reason string for a combo that currently has no eligible target. The 503 the
+ * caller returns carries this so an operator can tell a cooldown apart from a stale
+ * exhausted-quota cache or a disabled provider instead of guessing.
+ */
+export function describeComboUnavailability(
+  config: OcxConfig,
+  comboId: string,
+  now = Date.now(),
+): string {
+  const combo = getCombo(config, comboId);
+  if (!combo) return "combo not configured";
+  const parts: string[] = [];
+  for (const target of combo.targets) {
+    const key = targetKey(target);
+    const provider = config.providers[target.provider];
+    if (!provider) {
+      parts.push(`${key}: provider not configured`);
+      continue;
+    }
+    if (provider.disabled === true) {
+      parts.push(`${key}: provider disabled`);
+      continue;
+    }
+    if (cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now)) {
+      parts.push(`${key}: cached quota exhausted (refresh quotas to re-check)`);
+      continue;
+    }
+    const cooldown = earliestComboCooldown(comboId, [target], now);
+    if (cooldown !== undefined) {
+      parts.push(`${key}: cooling for ${Math.max(1, Math.ceil((cooldown.expiry - now) / 1000))}s`);
+      continue;
+    }
+    parts.push(`${key}: excluded by this request`);
+  }
+  const joined = parts.join("; ");
+  return joined.length > 400 ? `${joined.slice(0, 397)}...` : joined;
 }

@@ -285,6 +285,34 @@ export function clearComboTargetCooldowns(comboId?: string): void {
   }
 }
 
+/**
+ * Drop every combo cooldown recorded against these providers.
+ *
+ * A fresh, non-exhausted quota snapshot is recovery evidence: the window a cooldown was
+ * cooling against has been reset (at the provider, or manually outside OpenCodex).
+ * Without this, a combo can keep answering 503 "no available targets" for up to the
+ * cooldown's own lifetime even though quota is available again, because nothing
+ * re-evaluates cooldowns when quota evidence lands. Transient request-rate cooldowns
+ * caught in the sweep are benign: the worst case is one early retry that re-cools if
+ * the rate limit truly still stands.
+ */
+export function clearComboCooldownsForProviders(providers: Iterable<string>, now = Date.now()): number {
+  const wanted = new Set(providers);
+  if (wanted.size === 0) return 0;
+  let removed = 0;
+  for (const [key, cooldown] of targetCooldowns) {
+    if (cooldown.cooldownUntil <= now) continue;
+    // Key layout: `${comboId}\0${provider}/${model}`; provider ids never contain "/".
+    const target = key.split("\0", 2)[1];
+    const provider = target?.slice(0, target.indexOf("/"));
+    if (provider !== undefined && provider !== "" && wanted.has(provider)) {
+      targetCooldowns.delete(key);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 export type ComboFailureDecision = "hop" | "stop";
 export type ComboFailureCooldownScope = "none" | "target" | "provider";
 
