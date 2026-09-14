@@ -1374,7 +1374,9 @@
     "devin-cli-login.test.ts": "providers",
     "devin-cli-authmode-migration.test.ts": "providers",
     "zcode-start-plan.test.ts": "providers",
-    "zcode-attribution.test.ts": "adapters"
+    "zcode-attribution.test.ts": "adapters",
+    "cooldown-recovery.test.ts": "combos",
+    "quota-recovery-integration.test.ts": "combos"
   },
   "migrated": [
     "adapters",
