@@ -7,9 +7,12 @@
  * streams CloudChatEvent into AdapterEvent.
  */
 import type { AdapterEvent, OcxAssistantMessage, OcxContentPart, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTool, OcxToolCall, OcxToolResultMessage, OcxUsage } from "../types";
+import { namespacedToolName } from "../types";
 import type { IncomingMeta, ProviderAdapter } from "./base";
 import { streamChatEvents, allocateCascadeId, CloudChatError, type ChatHistoryItem, type ToolDef } from "./devin/cloud-direct";
+import type { ContentPart } from "./devin/cloud-direct/chat";
 import { getCachedCatalog } from "./devin/cloud-direct/catalog";
+import { collapseDevinModelUid } from "./devin/live-models";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { DEVIN_DEFAULT_API_SERVER, resolveDevinApiServer } from "../oauth/devin";
 
@@ -66,7 +69,15 @@ export function devinErrorClassification(error: unknown): { status?: number; err
 
 export const DEVIN_API_SERVER = DEVIN_DEFAULT_API_SERVER;
 
-const EFFORT_SUFFIXES = new Set(["low", "medium", "high", "xhigh", "max", "none", "1m", "max-1m", "none-1m", "fast"]);
+/**
+ * Reasoning-effort values a CALLER may name. Deliberately not the same set as
+ * the catalog suffix tokens: `priority` is a service tier that appears in a UID
+ * but is not something a caller asks for as effort, and `max-1m` / `none-1m`
+ * are compound values a caller can send that never appear as a trailing token.
+ * The two sets share most members and mean different things; merging them would
+ * both admit a tier as an effort and silently drop the compound values.
+ */
+const CALLER_EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max", "none", "1m", "max-1m", "none-1m", "fast"]);
 
 /**
  * Cognition's catalog spells model ids with hyphens (`swe-1-7`), but the same
@@ -79,9 +90,52 @@ export function normalizeDevinModelId(modelId: string): string {
   return modelId.replace(/\./g, "-");
 }
 
+/**
+ * Does this id already carry a catalog effort/variant suffix?
+ *
+ * Delegates to the collapser so there is one answer to "what is a suffix".
+ * The previous local set had drifted: it was missing `priority`, so
+ * `gpt-5-6-sol-medium-priority` read as unsuffixed and got a second suffix
+ * appended, producing a UID Cognition answers with an opaque permission_denied.
+ * Delegating also handles compound suffixes, which testing only the final
+ * hyphen-separated token never could.
+ */
 function hasEffortSuffix(modelId: string): boolean {
-  const parts = modelId.split("-");
-  return parts.length > 1 && EFFORT_SUFFIXES.has(parts[parts.length - 1]!);
+  return collapseDevinModelUid(modelId) !== modelId;
+}
+
+/**
+ * SWE-2 ships exactly three native lanes. Cognition spells them as the model id,
+ * not as a separate effort field, so an explicit caller effort has to be resolved
+ * to the UID before the suffix shortcut below accepts whatever the picker sent.
+ *
+ * Kept as a named table rather than an inline branch because the caller-effort
+ * set does not carry `ultra`, `off`, or `minimal`, so the two would drift apart
+ * silently.
+ * Values below Medium select Medium: SWE-2 has no lane under it, and rounding down
+ * to nothing would quietly disable its reasoning.
+ */
+const SWE2_EFFORT: Record<string, "medium" | "high" | "max"> = {
+  none: "medium",
+  off: "medium",
+  minimal: "medium",
+  low: "medium",
+  medium: "medium",
+  high: "high",
+  xhigh: "max",
+  ultra: "max",
+  max: "max",
+};
+
+/**
+ * Resolve an explicit effort onto a SWE-2 lane, or undefined when this is not a
+ * SWE-2 id or the caller named no usable effort. Undefined leaves every existing
+ * path untouched, which is what keeps other model families on suffix precedence.
+ */
+function resolveSwe2Variant(modelId: string, reasoningEffort?: string): string | undefined {
+  if (!/^swe-2(?:-(?:medium|high|max))?$/.test(modelId)) return undefined;
+  const mapped = reasoningEffort ? SWE2_EFFORT[reasoningEffort.toLowerCase()] : undefined;
+  return mapped ? `swe-2-${mapped}` : undefined;
 }
 
 /**
@@ -103,11 +157,16 @@ async function resolveWireModelUid(
   reasoningEffort?: string,
 ): Promise<string> {
   const modelId = normalizeDevinModelId(rawModelId);
+  // Explicit effort wins over a suffix the picker already baked into the id, so
+  // `swe-2-high` asked for at `medium` becomes `swe-2-medium` instead of ignoring
+  // the caller. Runs before the shortcut below, which would otherwise return early.
+  const swe2 = resolveSwe2Variant(modelId, reasoningEffort);
+  if (swe2) return swe2;
   if (hasEffortSuffix(modelId)) return modelId;
   const catalog = await getCachedCatalog(apiKey, host);
   if (catalog) {
     if (catalog.byUid.has(modelId)) return modelId;
-    const effort = reasoningEffort && EFFORT_SUFFIXES.has(reasoningEffort) ? reasoningEffort : "medium";
+    const effort = reasoningEffort && CALLER_EFFORT_VALUES.has(reasoningEffort) ? reasoningEffort : "medium";
     const suffixed = `${modelId}-${effort}`;
     if (catalog.byUid.has(suffixed)) return suffixed;
     // Fall back to any enabled variant of this base model.
@@ -116,9 +175,16 @@ async function resolveWireModelUid(
     }
   }
   // Degraded mode: append the default effort suffix.
-  const effort = reasoningEffort && EFFORT_SUFFIXES.has(reasoningEffort) ? reasoningEffort : "medium";
+  const effort = reasoningEffort && CALLER_EFFORT_VALUES.has(reasoningEffort) ? reasoningEffort : "medium";
   return `${modelId}-${effort}`;
 }
+
+/**
+ * Test seam. The resolver stays module-private because it reaches the catalog;
+ * exporting it under its bare name would make an async network-touching helper
+ * part of the adapter public API. Mirrors sanitizeToolDescriptionForCognitionForTests.
+ */
+export const resolveWireModelUidForTests = resolveWireModelUid;
 
 export class DevinMissingCredentialError extends Error {
   constructor() {
@@ -143,9 +209,31 @@ function textFromParts(content: string | OcxContentPart[] | undefined): string {
   return content.map((part) => (part.type === "text" ? part.text : "")).filter(Boolean).join("\n");
 }
 
-function toolResultText(message: OcxToolResultMessage): string {
-  const body = textFromParts(message.content);
-  return message.isError ? ("ERROR: " + body) : body;
+/**
+ * Convert inbound content parts to the multimodal shape the wire encoder accepts.
+ *
+ * The wire layer already carries images (ChatMessagePrompt field #10 ImageData),
+ * but every image was discarded at this boundary: textFromParts returned a
+ * text-only string and a message whose only content was an image was dropped
+ * entirely, which is why a pasted screenshot killed the turn and the only
+ * workaround was running OCR before sending. A data: URL carries everything
+ * field #10 needs; a remote https URL cannot be inlined without a fetch, so it
+ * stays as an explicit text reference rather than pretending the model can see
+ * a picture it cannot. Video has no Devin field and is skipped.
+ */
+function mapOcxContentToWire(content: string | OcxContentPart[] | undefined): string | ContentPart[] {
+  if (typeof content === "string" || !Array.isArray(content)) return content ?? "";
+  const out: ContentPart[] = [];
+  for (const part of content) {
+    if (part.type === "text" && part.text) {
+      out.push({ type: "text", text: part.text });
+    } else if (part.type === "image") {
+      const m = part.imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+      if (m) out.push({ type: "image", mimeType: m[1]!, base64Data: m[2]! });
+      else out.push({ type: "text", text: `[image url: ${part.imageUrl}]` });
+    }
+  }
+  return out;
 }
 
 function assistantToolCalls(message: OcxAssistantMessage): Array<{ id: string; name: string; arguments: string }> {
@@ -225,9 +313,12 @@ export function mapOcxMessagesToDevin(parsed: OcxParsedRequest): ChatHistoryItem
 
 function mapOneMessage(message: OcxMessage): ChatHistoryItem | undefined {
   if (message.role === "user" || message.role === "developer") {
-    const text = textFromParts(message.content).trim();
-    if (!text) return undefined;
-    return { role: message.role === "developer" ? "system" : "user", content: text };
+    const content = mapOcxContentToWire(message.content);
+    // An image with no caption text is a complete user message on its own.
+    // Dropping it — which is what the text-only extraction did — is why a
+    // pasted screenshot killed the turn before the model ever saw anything.
+    if (typeof content === "string" ? !content.trim() : content.length === 0) return undefined;
+    return { role: message.role === "developer" ? "system" : "user", content };
   }
   if (message.role === "assistant") {
     const toolCalls = assistantToolCalls(message);
@@ -244,9 +335,15 @@ function mapOneMessage(message: OcxMessage): ChatHistoryItem | undefined {
     };
   }
   if (message.role === "toolResult") {
+    const wireContent = mapOcxContentToWire(message.content);
+    const toolContent = message.isError
+      ? (typeof wireContent === "string"
+          ? `ERROR: ${wireContent}`
+          : [{ type: "text", text: "ERROR:" } as ContentPart, ...wireContent])
+      : wireContent;
     return {
       role: "tool",
-      content: toolResultText(message),
+      content: toolContent,
       tool_call_id: message.toolCallId,
     };
   }
@@ -262,13 +359,87 @@ export function mapOcxToolsToDevin(tools: OcxTool[] | undefined): ToolDef[] | un
   }));
 }
 
+/**
+ * Devin's request mapper advertises the local tool name, so a namespaced Codex tool such as
+ * `mcp__cua_repl__js` is sent upstream as `js`. Restore a returned bare name to its canonical request
+ * identity only when exactly one advertised tool owns it. A null owner is an ambiguous catalog and
+ * must fail before dispatch; an absent owner remains unchanged for the shared undeclared-tool guard
+ * to reject.
+ *
+ * Canonical names are registered as aliases of themselves because the adapter accepts them on return
+ * too. Tracking only local names let one tool's canonical identity collide with another tool's local
+ * name and resolve to the wrong owner: with `{ namespace: "a", name: "x" }` and
+ * `{ namespace: "b", name: "a__x" }`, a returned `a__x` is both the first tool's canonical identity
+ * and the second tool's advertised name, and it used to map to `b__a__x` — so the bridge dispatched
+ * the call to the wrong client tool. That case is genuinely ambiguous and now fails closed.
+ */
+function buildDevinReturnedToolNameMap(
+  tools: OcxTool[] | undefined,
+): ReadonlyMap<string, string | null> {
+  const names = new Map<string, string | null>();
+  const addOwner = (alias: string, canonical: string) => {
+    if (!names.has(alias)) {
+      names.set(alias, canonical);
+    } else if (names.get(alias) !== canonical) {
+      names.set(alias, null);
+    }
+  };
+  for (const tool of tools ?? []) {
+    const canonical = namespacedToolName(tool.namespace, tool.name);
+    addOwner(tool.name, canonical);
+    addOwner(canonical, canonical);
+  }
+  return names;
+}
+
+function restoreDevinReturnedToolName(
+  name: string,
+  names: ReadonlyMap<string, string | null>,
+): string | null {
+  return names.has(name) ? names.get(name)! : name;
+}
+
+type DevinMappedToolCallStart =
+  | Extract<AdapterEvent, { type: "tool_call_start" }>
+  | Extract<AdapterEvent, { type: "error" }>;
+
+function mapDevinToolCallStart(
+  id: string,
+  name: string,
+  names: ReadonlyMap<string, string | null>,
+): DevinMappedToolCallStart {
+  const restoredName = restoreDevinReturnedToolName(name, names);
+  if (restoredName === null) {
+    return {
+      type: "error",
+      message: "Devin emitted a bare client tool name that maps to multiple request-declared tools.",
+      status: 502,
+      retryable: false,
+    };
+  }
+  return { type: "tool_call_start", id, name: restoredName };
+}
+
+/** Test seam for the request-scoped tool-call event mapping used by runTurn. */
+export function mapDevinToolCallStartForTests(
+  id: string,
+  name: string,
+  tools: OcxTool[] | undefined,
+): DevinMappedToolCallStart {
+  return mapDevinToolCallStart(id, name, buildDevinReturnedToolNameMap(tools));
+}
+
 export function createDevinAdapter(
   provider: OcxProviderConfig,
   context: { providerId?: string } = {},
 ): ProviderAdapter {
-  // Which credential slot holds this row's tenant. Defaults to `devin` so every
-  // existing caller — including the tests that construct this adapter directly —
-  // behaves exactly as before.
+  // Which credential slot holds this row's tenant. The key is the configured
+  // provider id verbatim: `devin-cli` is a deprecated alias for the one merged
+  // `devin` provider, and the startup migration rekeys the config row and the
+  // credential slot together, so normalizing here would only misread a row that
+  // has not been migrated yet. Defaults to `devin` so every existing caller —
+  // including the tests that construct this adapter directly — behaves exactly
+  // as before.
   const credentialProviderId = context.providerId ?? "devin";
   const cascadeIds = new Map<string, string>();
   const CASCADE_ID_MAX = 256;
@@ -323,6 +494,7 @@ export function createDevinAdapter(
       // every RPC to the US server it is not provisioned on.
       const host = resolveDevinApiServer(provider.baseUrl, credentialProviderId);
       const modelUid = await resolveWireModelUid(rawModelId, apiKey, host, parsed.options.reasoning);
+      const returnedToolNames = buildDevinReturnedToolNameMap(parsed.context.tools);
       let openToolId: string | undefined;
       let usage: OcxUsage | undefined;
       let stopReason: string | undefined;
@@ -376,8 +548,13 @@ export function createDevinAdapter(
           }
           if (event.kind === "tool_call_start") {
             closeOpenTool();
+            const mapped = mapDevinToolCallStart(event.id, event.name, returnedToolNames);
+            if (mapped.type === "error") {
+              emit({ ...mapped, ...(usage ? { usage } : {}) });
+              return;
+            }
             openToolId = event.id;
-            emit({ type: "tool_call_start", id: event.id, name: event.name });
+            emit(mapped);
             continue;
           }
           if (event.kind === "tool_call_args") {

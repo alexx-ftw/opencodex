@@ -1048,6 +1048,39 @@ export async function replaceProviderAccountSet(
   }, [provider, set]);
 }
 
+export type ProviderCredentialRekeyOutcome = "moved" | "absent" | "conflict";
+
+/**
+ * Move a provider's whole account set to a different provider key.
+ *
+ * Used by provider-id merge migrations (e.g. devin-cli -> devin): the
+ * credential itself stays valid under the canonical id, only the slot name is
+ * stale. The move goes through mutateStore so it takes the same file lock and
+ * revision bookkeeping as every other auth.json write.
+ *
+ * Both slots occupied is a REFUSAL, not a merge: two account sets may belong
+ * to different humans, and picking a survivor is a user decision, so the
+ * outcome is reported and both are left in place.
+ *
+ * Orphaned auth.refresh.<provider>.<hash>.json intent files are not moved.
+ * They are keyed by provider name plus an account-id hash, so a file left
+ * under the old id simply never matches a lookup again — harmless litter, and
+ * rewriting them would have to guess at an intent's in-flight state anyway.
+ */
+export async function rekeyProviderCredentials(
+  from: string,
+  to: string,
+): Promise<ProviderCredentialRekeyOutcome> {
+  return await mutateStore(store => {
+    const source = store[from];
+    if (!source) return "absent";
+    if (store[to]) return "conflict";
+    store[to] = source;
+    delete store[from];
+    return "moved";
+  }, [from, to]);
+}
+
 export async function markAccountNeedsReauth(
   provider: string,
   accountId: string,

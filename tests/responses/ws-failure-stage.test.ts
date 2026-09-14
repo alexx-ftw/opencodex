@@ -3,7 +3,10 @@ import {
   classifyCodexWsFailure,
   closedBeforeTerminalMessage,
   codexWsFailureDetail,
+  markCodexWsStage,
+  readCodexWsStage,
   type CodexWsFailureStage,
+  type CodexWsStageRecord,
 } from "../../src/server/responses/codex-ws-wire";
 import {
   codexWsUpstreamFetch,
@@ -243,6 +246,97 @@ describe("codexWsUpstreamFetch failure reporting", () => {
       );
     } finally {
       jest.useRealTimers();
+    }
+  });
+
+  test("the prelude-timeout response carries the stage as a durable record", async () => {
+    jest.useFakeTimers();
+    const opened = Promise.withResolvers<void>();
+    const noFallback = async () => {
+      throw new Error("fallback must not run after open");
+    };
+    try {
+      installFake(ws => { ws.emit("open", {}); opened.resolve(); });
+      const pending = codexWsUpstreamFetch(
+        CODEX_URL,
+        streamingInit(),
+        noFallback as unknown as typeof fetch,
+        BOUNDED_WS_RUNTIME,
+      );
+      await opened.promise;
+      jest.advanceTimersByTime(CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS);
+      const response = await pending;
+      expect(response.status).toBe(504);
+      const stage = readCodexWsStage(response);
+      expect(stage).toBeDefined();
+      expect(stage?.upstreamFrames).toBe(0);
+      expect(stage?.firstFrameMs).toBeNull();
+      expect(stage?.closeCode).toBeNull();
+      expect(stage?.sent).toBe(true);
+      expect(stage?.requestBytes).toBeGreaterThan(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe("codex ws stage record marker (#4191)", () => {
+  const stage: CodexWsStageRecord = {
+    requestBytes: 1234,
+    sent: true,
+    upstreamFrames: 3,
+    controlFrames: 1,
+    relayedEvents: 2,
+    firstFrameMs: 42,
+    elapsedMs: 900,
+    pings: 1,
+    pongs: 1,
+    closeCode: 1006,
+    reused: false,
+    ocxVersion: "2.52.0",
+    bunVersion: "1.4.0",
+  };
+
+  test("mark/read round trip on the resolved Response", () => {
+    const response = new Response("ok");
+    expect(readCodexWsStage(response)).toBeUndefined();
+    markCodexWsStage(response, stage);
+    expect(readCodexWsStage(response)).toEqual(stage);
+  });
+
+  test("a committed exchange ends with the final counters on its stage record", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
+    });
+    const noFallback = async () => {
+      throw new Error("fallback must not run after open");
+    };
+    const response = await codexWsUpstreamFetch(
+      CODEX_URL,
+      streamingInit(),
+      noFallback as unknown as typeof fetch,
+      BOUNDED_WS_RUNTIME,
+    );
+    expect(response.status).toBe(200);
+    await response.text();
+    const stage = readCodexWsStage(response);
+    expect(stage).toBeDefined();
+    expect(stage?.requestBytes).toBeNull();
+    expect(stage?.closeCode).toBeNull();
+    expect(stage?.sent).toBe(true);
+    expect(stage?.relayedEvents).toBeGreaterThan(0);
+  });
+
+  test("the serialized record is numeric/boolean/semver only", () => {
+    const json = JSON.stringify(stage);
+    expect(json).not.toContain("reason");
+    expect(json).not.toMatch(/header|authorization|conversation|body/i);
+    for (const [key, value] of Object.entries(stage)) {
+      expect(["number", "boolean", "string", "object"]).toContain(typeof value);
+      if (typeof value === "string") expect(value.length).toBeLessThan(64);
+      expect(key).not.toContain("reason");
     }
   });
 });

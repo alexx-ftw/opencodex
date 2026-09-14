@@ -13,6 +13,8 @@ import {
 import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import type { CodexAccountCredentialRecord, CodexAccountCredentials } from "../types";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
+import { isValidCodexAccountId } from "./account-id";
+import type { PoolQuotaWriter } from "./quota-types";
 import { CODEX_REFRESH_FLIGHT_CEILING_MS } from "./quota-recovery-timing";
 
 type LegacyCodexAccountStore = Record<string, CodexAccountCredentials>;
@@ -163,6 +165,7 @@ export function saveCodexAccountCredential(
       generation: (current?.generation ?? 0) + 1,
       refreshGrantFingerprint,
       replacedAt: current ? Date.now() : undefined,
+      quotaHistoryIdentity: crypto.randomUUID(),
       ...preservedValidationMetadata(current),
       ...(options.validationPending ? {
         codexValidationPending: true,
@@ -257,6 +260,75 @@ export function readCodexAccountRecord(id: string): CodexAccountCredentialRecord
   return loadCodexAccountRecordStore()[id] ?? null;
 }
 
+const QUOTA_HISTORY_IDENTITY_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function validQuotaHistoryIdentity(value: unknown): value is string {
+  return typeof value === "string" && QUOTA_HISTORY_IDENTITY_RE.test(value);
+}
+
+type DispatchedPoolCredential = Pick<CodexAccountCredentials, "accessToken" | "chatgptAccountId"> & { generation: number };
+
+function matchesDispatchedPoolCredential(record: CodexAccountCredentialRecord | undefined | null, dispatched: DispatchedPoolCredential): record is CodexAccountCredentialRecord & { credential: CodexAccountCredentials } {
+  return !!record?.credential && record.deletedAt == null
+    && dispatched.accessToken.length > 0 && dispatched.chatgptAccountId.length > 0
+    && Number.isSafeInteger(dispatched.generation) && dispatched.generation >= 0
+    && record.generation === dispatched.generation
+    && record.credential.accessToken === dispatched.accessToken
+    && record.credential.chatgptAccountId === dispatched.chatgptAccountId;
+}
+
+/** Optional evidence capture; a stale credential or unavailable store never gains a new writer. */
+export function capturePoolQuotaWriter(accountId: string, dispatched: DispatchedPoolCredential): PoolQuotaWriter | undefined {
+  if (!isValidCodexAccountId(accountId)) return undefined;
+  try {
+    const current = readCodexAccountRecord(accountId);
+    if (!matchesDispatchedPoolCredential(current, dispatched)) return undefined;
+    if (validQuotaHistoryIdentity(current.quotaHistoryIdentity)) {
+      return { accountId, credentialGeneration: dispatched.generation, historyIdentity: current.quotaHistoryIdentity };
+    }
+    return withCredentialMutationLockSync(() => {
+      const store = loadCodexAccountRecordStore();
+      const locked = store[accountId];
+      if (!matchesDispatchedPoolCredential(locked, dispatched)) return undefined;
+      if (!validQuotaHistoryIdentity(locked.quotaHistoryIdentity)) {
+        locked.quotaHistoryIdentity = crypto.randomUUID();
+        // Identity metadata is not a new credential; preserve generation and mutation epoch.
+        persist(store);
+      }
+      return { accountId, credentialGeneration: dispatched.generation, historyIdentity: locked.quotaHistoryIdentity };
+    });
+  } catch {
+    // History is optional evidence. Permission, lock and disk errors cannot fail inference.
+    return undefined;
+  }
+}
+
+/** Read-only retention identity; unlike capture this never initializes legacy metadata. */
+export function poolQuotaHistoryIdentity(accountId: string): string | undefined {
+  if (!isValidCodexAccountId(accountId)) return undefined;
+  try {
+    const record = readCodexAccountRecord(accountId);
+    return record?.credential && record.deletedAt == null && validQuotaHistoryIdentity(record.quotaHistoryIdentity)
+      ? record.quotaHistoryIdentity : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Recheck append admission after upstream I/O; refresh may retire a writer without erasing history. */
+export function isPoolQuotaWriterLive(writer: PoolQuotaWriter): boolean {
+  if (!isValidCodexAccountId(writer.accountId)) return false;
+  try {
+    const record = readCodexAccountRecord(writer.accountId);
+    return !!record?.credential && record.deletedAt == null
+      && record.generation === writer.credentialGeneration
+      && validQuotaHistoryIdentity(writer.historyIdentity)
+      && record.quotaHistoryIdentity === writer.historyIdentity;
+  } catch {
+    return false;
+  }
+}
+
 export function isCodexAccountGenerationLive(id: string, generation: number): boolean {
   const record = readCodexAccountRecord(id);
   return !!record?.credential && record.deletedAt == null && record.generation === generation;
@@ -281,6 +353,8 @@ export function saveCodexAccountCredentialIfGeneration(
       generation: generation + 1,
       refreshGrantFingerprint,
       replacedAt: current.replacedAt,
+      quotaHistoryIdentity: current.credential.chatgptAccountId === cred.chatgptAccountId
+        ? current.quotaHistoryIdentity : crypto.randomUUID(),
       ...preservedValidationMetadata(current),
     };
     persistCredentialMutation(store);
@@ -340,6 +414,8 @@ export function commitRefreshedCodexCredentialWithAliases(
       generation: generation + 1,
       refreshGrantFingerprint,
       replacedAt: current.replacedAt,
+      quotaHistoryIdentity: current.credential.chatgptAccountId === cred.chatgptAccountId
+        ? current.quotaHistoryIdentity : crypto.randomUUID(),
       ...preservedValidationMetadata(current),
     };
 
@@ -354,6 +430,7 @@ export function commitRefreshedCodexCredentialWithAliases(
       priorFingerprint !== undefined
       && priorCredential.refreshToken !== cred.refreshToken
       && !!priorCredential.chatgptAccountId
+      && priorCredential.chatgptAccountId === cred.chatgptAccountId
     ) {
       for (const [aliasId, alias] of Object.entries(store)) {
         if (aliasId === id || alias.deletedAt != null || !alias.credential) continue;
@@ -369,6 +446,7 @@ export function commitRefreshedCodexCredentialWithAliases(
           generation: aliasGeneration,
           refreshGrantFingerprint,
           replacedAt: alias.replacedAt,
+          quotaHistoryIdentity: alias.quotaHistoryIdentity,
           ...preservedValidationMetadata(alias),
         };
         propagatedAliases.push({ id: aliasId, generation: aliasGeneration });

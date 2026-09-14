@@ -88,6 +88,7 @@
         "src/router.ts",
         "src/server/",
         "src/service.ts",
+        "src/service/",
         "src/stall-timeout.ts",
         "src/storage/",
         "src/tray/",
@@ -139,6 +140,17 @@
       "documents": [
         "src/codex/",
         "src/providers/",
+        "src/server/"
+      ]
+    },
+    {
+      "path": "transports/byte-accounting.md",
+      "tier": 3,
+      "title": "Byte Accounting",
+      "scope": "Request-copy and stream-buffer byte accounting shared by parsing, SSE rewriting, the adapters, and the translator budget.",
+      "documents": [
+        "src/adapters/",
+        "src/lib/",
         "src/server/"
       ]
     },
@@ -366,7 +378,7 @@
       "path": "remote-workspace.md",
       "tier": 3,
       "title": "Remote Workspace",
-      "scope": "Inactive workspace protocol, cryptographic identity primitives, and bounded framing.",
+      "scope": "Opt-in workspace identity, executor grants, runtime adapters, management and dashboard integration.",
       "documents": [
         "src/remote-control/"
       ]

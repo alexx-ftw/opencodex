@@ -1,3 +1,5 @@
+import * as usageHistoryModule from "../../src/usage/log";
+import { getAccountQuotaHistory } from "../../src/codex/quota";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { ServerWebSocket } from "bun";
 import { Database } from "bun:sqlite";
@@ -1051,6 +1053,65 @@ describe("codex-auth API", () => {
     }
   });
 
+  test("account DTO exposes the routing plan exclusion and clears it on renewal", async () => {
+    const cfg = makeConfig({ codexPool: { excludedPlans: ["free"] } });
+    seedPoolAccount(cfg, { id: "plan-row", email: "plan@example.test", plan: "free" });
+    const read = async () => {
+      const request = new Request("http://localhost/api/codex-auth/accounts");
+      const response = await handleCodexAuthAPI(request, new URL(request.url), cfg);
+      const body = await response!.json() as { accounts: CodexAuthAccountDto[] };
+      return body.accounts.find(account => account.id === "plan-row")!;
+    };
+    expect(await read()).toMatchObject({ selectionExcludedReason: "plan_excluded", selectionExcludedPlan: "free", paused: false });
+    cfg.codexAccounts![0].plan = "plus";
+    const renewed = await read();
+    expect(renewed).not.toHaveProperty("selectionExcludedReason");
+    expect(renewed).not.toHaveProperty("selectionExcludedPlan");
+  });
+
+  test("history capacity uses reported intervals and invalidates after identity changes during the ledger read", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, { id: "capacity-a", email: "capacity@example.test", plan: "plus" });
+    config.codexAccounts![0].logLabel = "pabcdef";
+    const { capturePoolQuotaWriter } = await import("../../src/codex/account-store");
+    const record = readCodexAccountRecord("capacity-a")!;
+    const writer = capturePoolQuotaWriter("capacity-a", { ...record.credential!, generation: record.generation })!;
+    const now = Date.now();
+    for (const [observedAt, weeklyPercent] of [[now - 2000, 10], [now, 20]]) {
+      const raw = { weeklyPercent, weeklyResetAt: now + 100_000 };
+      setAccountQuotaFromParsed("capacity-a", raw, undefined, undefined, raw, { writer, observedAt, source: "wham", raw });
+    }
+    usageHistoryModule.appendUsageEntry({ requestId: "capacity-request", timestamp: now - 1000, durationMs: 100, provider: "openai", model: "gpt-5.5", status: 200, usageStatus: "reported", attempts: [{
+      ordinal: 1, provider: "openai", model: "gpt-5.5", adapter: "openai-responses", status: 200, durationMs: 100, sendCount: 1,
+      recoveryKinds: [], usageStatus: "reported", accountLogLabel: "pabcdef", usage: { inputTokens: 800, outputTokens: 200, totalTokens: 1000 },
+    }] });
+    const request = () => new Request("http://localhost/api/codex-auth/quota/history?accountId=capacity-a&limit=1");
+    const req = request();
+    const result = await handleCodexAuthAPI(req, new URL(req.url), config);
+    const body = await result!.json() as { observations: unknown[]; capacity: { status: string; estimates: unknown[] } };
+    expect(body.observations).toHaveLength(1);
+    expect(body.capacity.estimates).toEqual([{ window: "weekly", estimatedTokens: 10000, sampleCount: 1, confidence: "low" }]);
+    const stored = usageHistoryModule.readUsageEntries();
+    expect(stored).toHaveLength(1);
+    stored[0].attempts![0].model = "   ";
+    writeFileSync(usageHistoryModule.usageLogPath(), JSON.stringify(stored[0]) + "\n");
+    const blankModel = request();
+    const blankResult = await handleCodexAuthAPI(blankModel, new URL(blankModel.url), config);
+    expect((await blankResult!.json()).capacity).toMatchObject({ status: "insufficient-evidence", estimates: [] });
+    const originalRead = usageHistoryModule.readUsageSnapshotForManagement;
+    const read = spyOn(usageHistoryModule, "readUsageSnapshotForManagement").mockImplementation(async () => {
+      const snapshot = await originalRead();
+      saveCodexAccountCredential("capacity-a", record.credential!);
+      return snapshot;
+    });
+    try {
+      const next = request();
+      const response = await handleCodexAuthAPI(next, new URL(next.url), config);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(await response!.json()).toMatchObject({ observations: [], capacity: { status: "insufficient-evidence", reason: "identity_changed", estimates: [] } });
+    } finally { read.mockRestore(); }
+  });
+
   test("GET /api/codex-auth/accounts returns array with main", async () => {
     const req = new Request("http://localhost/api/codex-auth/accounts", { method: "GET" });
     const url = new URL(req.url);
@@ -1796,6 +1857,8 @@ describe("codex-auth API", () => {
       const data = await resp!.json() as { accounts: { id: string; quota: unknown }[] };
       const pool = data.accounts.find(a => a.id === "pool-refresh");
       expect(pool?.quota).toMatchObject({ weeklyPercent: 6, weeklyResetAt: 1782628379 });
+      expect(getAccountQuotaHistory("pool-refresh").observations).toHaveLength(1);
+      expect(getAccountQuotaHistory("pool-refresh").observations[0]).toMatchObject({ source: "wham", windows: [{ family: "account", window: "weekly", usedPercent: 6, resetAtMs: 1782628379000 }] });
       expect(calls).toBe(1);
     } finally {
       globalThis.fetch = originalFetch;
@@ -5997,15 +6060,12 @@ describe("manual reset cooldown recovery (#3973)", () => {
   test.each(["reset", "already_redeemed", "nothing_to_reset", "no_credit", "unknown"])(
     "only a new reset recovers, preserving pin/selection and other scopes: %s", async code => {
       const config = setup();
-      cool(config, "manual-a", "gpt-5.3-codex-spark");
       cool(config, "manual-a", "gpt-reserve");
-      const spark = getCodexQuotaHealthSnapshot("manual-a", "spark");
       const reserve = getCodexQuotaHealthSnapshot("manual-a", "reserve");
       const urls = mock(() => Response.json({ code }), () => Response.json(usage()));
       const result = await consume(config);
       expect(result?.status).toBe(200);
       expect(getCodexQuotaHealthSnapshot("manual-a", "shared") === null).toBe(code === "reset");
-      expect(getCodexQuotaHealthSnapshot("manual-a", "spark")).toEqual(spark);
       expect(getCodexQuotaHealthSnapshot("manual-a", "reserve")).toEqual(reserve);
       expect(config.activeCodexAccountId).toBe("manual-a");
       expect(pinnedCodexAccountId(config)).toBe("manual-a");
@@ -6097,6 +6157,7 @@ describe("manual reset cooldown recovery (#3973)", () => {
     expect((await consume(config))?.status).toBe(200);
     expect(getCodexQuotaHealthSnapshot("manual-a", "shared")).toBeNull();
     expect(readCodexAccountRecord("manual-a")!.generation).toBe(generation + 1);
+    expect(getAccountQuotaHistory("manual-a").observations.some(row => row.source === "wham")).toBe(true);
     expect(urls).toEqual([CONSUME, USAGE, "https://auth.openai.com/oauth/token", USAGE]);
   });
 

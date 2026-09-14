@@ -17,6 +17,7 @@ import { saveConfig } from "../../src/config";
 import { startServer } from "../../src/server";
 import { runListenerShutdown } from "../../src/server/lifecycle";
 import {
+  AuxiliaryListenerBindError,
   findAvailablePort,
   PortUnavailableError,
   setEphemeralPortAllocatorForTests,
@@ -182,17 +183,21 @@ describe("hub management ingress", () => {
   });
 
   test("a failed management bind rolls back both earlier listeners", async () => {
-    const managementPort = await freePort();
-    const loopbackPort = await findAvailablePort(0, "127.0.0.1", { reservedPort: managementPort });
-    const publicPort = await findAvailablePort(0, "127.0.0.1", { reservedPort: loopbackPort });
     const squatter = Bun.serve({
-      port: managementPort,
+      port: 0,
       hostname: "127.0.0.1",
       fetch: () => new Response("occupied"),
     });
+    const managementPort = squatter.port!;
+    const loopbackPort = await freePort();
+    const publicPort = await findAvailablePort(0, "127.0.0.1", { reservedPort: loopbackPort });
     saveConfig(hubIngressConfig(managementPort, loopbackPort));
     try {
-      expect(() => startServer(publicPort)).toThrow();
+      let failure: unknown;
+      try { startServer(publicPort); } catch (error) { failure = error; }
+      expect(failure).toBeInstanceOf(AuxiliaryListenerBindError);
+      expect(failure).toMatchObject({ listener: "hub.managementIngress", port: managementPort, hostname: "127.0.0.1" });
+      expect((failure as Error).cause).toBeDefined();
       for (const port of [publicPort, loopbackPort]) {
         const rebound = Bun.serve({ port, hostname: "127.0.0.1", fetch: () => new Response("ok") });
         await rebound.stop(true);
@@ -759,7 +764,11 @@ describe("unauthenticated loopback listener", () => {
     });
     saveConfig(baseConfig(loopbackPort));
     try {
-      expect(() => startServer(publicPort)).toThrow();
+      let failure: unknown;
+      try { startServer(publicPort); } catch (error) { failure = error; }
+      expect(failure).toBeInstanceOf(AuxiliaryListenerBindError);
+      expect(failure).toMatchObject({ listener: "unauthenticatedLoopbackListener", port: loopbackPort, hostname: "127.0.0.1" });
+      expect((failure as Error).cause).toBeDefined();
 
       const rebound = Bun.serve({
         port: publicPort,
@@ -782,6 +791,17 @@ describe("unauthenticated loopback listener", () => {
 });
 
 describe("composite listener shutdown", () => {
+  test("starts socket-owner cleanup before waiting for a graceful listener drain", async () => {
+    const ran: string[] = [];
+    let release!: () => void;
+    const closed = new Promise<void>(resolve => { release = resolve; });
+    await runListenerShutdown([
+      async () => { ran.push("admission-closed"); await closed; ran.push("drained"); },
+      async () => { ran.push("owner-cleanup"); release(); },
+    ], async () => { ran.push("lifecycle"); });
+    expect(ran).toEqual(["admission-closed", "owner-cleanup", "drained", "lifecycle"]);
+  });
+
   // Both listeners share one `stop`, and the two properties it must hold pull against each
   // other: keep cleaning up after a failure, yet still report that failure. A test against a
   // live server cannot inject the rejection, so the orchestration was extracted.
@@ -844,7 +864,7 @@ describe("seams the runtime cannot defend", () => {
     // issued from a sibling Bun.serve in the same process. Another version or platform is not
     // promised to, and the loopback listener would then fail to upgrade at all.
     expect(serverSource).not.toMatch(/\bif \(server\.upgrade\(req,/);
-    expect(serverSource.match(/requestServer\.upgrade\(req,/g)?.length).toBe(2);
+    expect(serverSource.match(/requestServer\.upgrade\(req,/g)?.length).toBe(3);
   });
 
   test("the loopback listener binds 127.0.0.1 explicitly", () => {

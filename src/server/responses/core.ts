@@ -1,3 +1,4 @@
+import { capturePoolQuotaWriter } from "../../codex/account-store";
 import type { Server } from "bun";
 import { recordContextSessionOwner } from "../../codex/context-owner";
 import { contextRelayActivated } from "../../codex/context-compat";
@@ -104,7 +105,10 @@ import {
 } from "../../lib/errors";
 import { injectionDebugLog } from "../../lib/injection-debug-log";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
-import { enrichOpenCodeZenUpstreamMessage } from "../../providers/opencode-zen-rate-limit";
+import {
+  enrichOpenCodeZenUpstreamMessage,
+  isTransientConsoleGoUploadRejection,
+} from "../../providers/opencode-zen-rate-limit";
 import { CODE_MODE_EXEC_TOOL_NAME, modelInList, namespacedToolName } from "../../types";
 import type {
   AdapterEvent,
@@ -154,12 +158,14 @@ import {
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import { buildWebSearchTool, planWebSearch, runWithWebSearch, shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
 import {
-  createOllamaBridgeExecutor,
+  createPassthroughWebSearchBridgeExecutor,
   createPassthroughWebSearchBridgeStream,
   planPassthroughWebSearchBridge,
+  resolvePassthroughWebSearchBridgeAuth,
+  shouldResolveOpenAiPassthroughWebSearchBridge,
 } from "../../web-search/passthrough-bridge";
 import { buildImageTool, buildVideoTool, planImageBridge, planVideoBridge, runWithImageBridge, clampImageMaxRounds, IMAGE_GEN_TOOL_NAME, VIDEO_GEN_TOOL_NAME } from "../../images";
-import { describeImagesInPlace, isModelTextOnly, planVisionSidecar, resolveOpenAiVisionModel, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
+import { describeImagesInPlace, planVisionSidecar, requiresVisionPreprocessing, resolveOpenAiVisionModel, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
 import { createAdapterEventQueue, preflightAdapterEvents, type AdapterEventQueue } from "../../adapters/run-turn-queue";
 import {
   applyCodexAuthContextToProvider,
@@ -216,7 +222,21 @@ import {
   isNonReplayableResponse,
   isTransientUpstreamStatus,
   prepareSameTarget429Wait,
+  sleepWithAbort,
+  TRANSIENT_RETRY_MAX_ATTEMPTS,
+  SendBudgetExhaustedError,
+  type TransientSendBudget,
 } from "../../lib/upstream-retry";
+import {
+  createRequestExecutionBudget,
+  isRequestExecutionBudget,
+  type SendClass,
+  type SingleUseDispatchPermit,
+} from "../../lib/request-execution-budget";
+import {
+  chargeWorkflowSends,
+  workflowSendCeilingReached,
+} from "../../lib/workflow-budget";
 import {
   ForwardAdmissionCredentialError,
   hasForwardableCodexBearer,
@@ -291,6 +311,7 @@ import {
 } from "../lifecycle";
 import { redactSecretString, sanitizeLogMetadataString } from "../../lib/redact";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
+import { isReasoningEffortRejection, planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
 import {
   ENCRYPTED_FUNCTION_OUTPUT_REJECTION,
   isRateLimitOrQuotaFailureMessage,
@@ -346,6 +367,7 @@ import {
   markEagerRelaySseResponse,
   markNativePassthroughSseResponse,
   relaySseWithFailedTail,
+  codexSafetyBufferingFilterOptions,
   relayWithAbort,
   sanitizePassthroughHeaders,
 } from "../relay";
@@ -364,17 +386,12 @@ import {
 import { isWin32EagerRewrite, selectEagerPath } from "../../lib/bun-stream-caps";
 import { cancelBodyOnAbort } from "../../lib/abort";
 import { isCodexWsUpstreamResponse, type BunRuntimeGateInput } from "./ws-upstream";
+import { readCodexWsStage } from "./codex-ws-wire";
 import {
   createResponsesItemIdPayloadRewrite,
   hasResponsesItemIdRepair,
   repairResponsesJsonItemIds,
 } from "../responses-item-id-repair";
-import {
-  createReasoningSummaryChannelPayloadRewrite,
-  rewriteReasoningSummaryInJson,
-  rewriteReasoningSummaryInJsonString,
-  routeUsesContentChannelReasoning,
-} from "../responses-reasoning-summary-rewrite";
 import {
   createImageGenCallRestoreRewrite,
   imageGenToolCallAliases,
@@ -392,7 +409,7 @@ import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/cat
 
 import { buildToolBridgeMaps, collabSurface, injectDeveloperMessage, multiAgentGuidanceText } from "./collaboration";
 import { mapCodexAuthContextErrorToResponse, nativeMainRefreshFailureResponse } from "./codex-auth-error";
-import { hasUnreadableEncryptedAgentTask, looksLikeBackendCiphertext, sanitizeEncryptedContentInPlace } from "./encrypted-payload";
+import { hasUnreadableEncryptedAgentTask, looksLikeBackendCiphertext, sanitizeEncryptedContentInPlace, stripAgentMessageCiphertextInPlace } from "./encrypted-payload";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel, storedPoolReplayDispatchNotifier, type ProviderFetchOptions } from "./fetch-helpers";
 import { classifyTransportFailureKind, transportErrorCode } from "../../lib/upstream-reachability";
 import {
@@ -431,6 +448,13 @@ import {
   restoreRoutedNamespaceCallsInJson,
   type RoutedNamespaceToolAliases,
 } from "../../responses/namespace-tool-compat";
+import {
+  createPlaintextV2AgentMessageCallRestoreRewrite,
+  PLAINTEXT_V2_AGENT_MESSAGE_RESTORE_OVERFLOW_MESSAGE,
+  restorePlaintextV2AgentMessageCalls,
+  restorePlaintextV2AgentMessageCallsInJsonResult,
+  shouldPreparePlaintextV2AgentMessages,
+} from "../../responses/plaintext-v2-agent-messages";
 import {
   createMuseToolNameRestoreRewrite,
   restoreMuseToolNames,
@@ -770,6 +794,18 @@ function isEncryptedFunctionOutputRejection(bodyText: string): boolean {
   }
 }
 
+/**
+ * #4469: reasoning encrypted_content is minted per caller identity, so replaying it under a
+ * different caller is rejected with "reasoning `encrypted_content` was not issued to this
+ * caller". Substring checks tolerate the optional backticks and a leading or trailing
+ * sentence, while the "was not issued to this caller" anchor plus an encrypted-content or
+ * reasoning subject keep unrelated invalid_request_error prose from gaining a hidden resend.
+ */
+function isReasoningBlobCallerMismatchMessage(message: string): boolean {
+  if (!message.includes("was not issued to this caller")) return false;
+  return message.includes("encrypted_content") || message.includes("reasoning");
+}
+
 function isSelfIdentifiedOpaqueBlobRejection(bodyText: string): boolean {
   if (isEncryptedFunctionOutputRejection(bodyText)) return true;
   try {
@@ -782,7 +818,7 @@ function isSelfIdentifiedOpaqueBlobRejection(bodyText: string): boolean {
   try {
     const payload = JSON.parse(bodyText) as unknown;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-    const record = payload as { code?: unknown; error?: unknown };
+    const record = payload as { code?: unknown; type?: unknown; message?: unknown; error?: unknown };
 
     if (record.error && typeof record.error === "object" && !Array.isArray(record.error)) {
       const error = record.error as { type?: unknown; code?: unknown; message?: unknown };
@@ -796,8 +832,22 @@ function isSelfIdentifiedOpaqueBlobRejection(bodyText: string): boolean {
             " could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
           )
         ) return true;
+        // #4469: the caller-mismatch wording arrives without a dedicated code, so the
+        // message itself is the identity. It is not gated on code being null — the upstream
+        // may attach a generic code — because the anchored phrase is already specific.
+        if (typeof error.message === "string" && isReasoningBlobCallerMismatchMessage(error.message)) {
+          return true;
+        }
       }
     }
+
+    // The flat stream-error envelope carries type/message at the top level rather than under
+    // an error object; the same anchored identity applies there.
+    if (
+      record.type === "invalid_request_error"
+      && typeof record.message === "string"
+      && isReasoningBlobCallerMismatchMessage(record.message)
+    ) return true;
 
     if (record.code !== "invalid-argument" || typeof record.error !== "string") return false;
     return record.error.startsWith("Could not decode the compaction blob")
@@ -813,8 +863,9 @@ function isSelfIdentifiedOpaqueBlobRejection(bodyText: string): boolean {
  * The outbound-body check is intentional: the inbound transcript may contain a proxy envelope or
  * compaction blob that the adapter already lowered, in which case a replay would be byte-identical.
  * OpenAI usually exposes a dedicated nested code; ChatGPT also emits one exact code-less
- * unverifiable-ciphertext message. xAI's code is generic, so its two concrete decoder error
- * identities are also required. Unrelated error prose must never gain a hidden resend.
+ * unverifiable-ciphertext message, and #4469 added the anchored caller-mismatch wording for
+ * reasoning blobs minted under a different caller. xAI's code is generic, so its two concrete
+ * decoder error identities are also required. Unrelated error prose must never gain a hidden resend.
  */
 export function shouldAttemptOpaqueBlobRecovery(args: {
   status: number;
@@ -836,6 +887,28 @@ export function shouldAttemptOpaqueBlobRecovery(args: {
     && isSelfIdentifiedOpaqueBlobRejection(args.errorBody);
 }
 
+/**
+ * Peek the upstream error body for the reasoning-effort downgrade. Only 400/403 are considered
+ * and the body must be complete and display-safe, the same contract the other rejection peeks
+ * use. The match is deliberately narrow: the upstream has to name reasoning effort, so an
+ * unrelated 400 never triggers a replay.
+ */
+async function reasoningEffortRejectionText(
+  response: Response,
+  alreadyAttempted: boolean,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  if (alreadyAttempted) return undefined;
+  if (response.status !== 400 && response.status !== 403) return undefined;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    if (!body.displaySafe || body.truncated) return undefined;
+    return isReasoningEffortRejection(body.text) ? body.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function opaqueBlobRejectionBodyForRecovery(
   response: Response,
   outboundBody: string | undefined,
@@ -851,6 +924,31 @@ async function opaqueBlobRejectionBodyForRecovery(
     || alreadyAttempted
     || !outboundResponsesBodyCarriesOpaqueBlob(outboundBody)
   ) return undefined;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    return body.displaySafe && !body.truncated ? body.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Backoff for the single exact-request replay after a canonical Console upload rejection.
+ */
+const CONSOLE_GO_UPLOAD_RETRY_DELAY_MS = 800;
+
+/**
+ * Peek the upstream error body for the Console Go transient-400 recovery. Only a complete,
+ * display-safe body may drive a retry decision (same contract as
+ * opaqueBlobRejectionBodyForRecovery), and reading a clone leaves the original response intact
+ * for the caller's own error surface when no retry is taken.
+ */
+async function consoleGoUploadRejectionBody(
+  response: Response,
+  alreadyAttempted: boolean,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  if (isNonReplayableResponse(response) || response.status !== 400 || alreadyAttempted) return undefined;
   try {
     const body = await readBoundedResponseBody(response.clone(), { signal });
     return body.displaySafe && !body.truncated ? body.text : undefined;
@@ -1050,7 +1148,7 @@ function codexWsQuotaObserver(authCtx: CodexAuthContext, provider: OcxProviderCo
   const mainWriter = authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined;
   return headers => {
     if (credentialGeneration !== undefined && !isCodexAccountGenerationLive(accountId, credentialGeneration)) return;
-    applyCapturedCodexQuota(accountId, headers, writerGeneration, mainWriter, { modelId });
+    applyCapturedCodexQuota(accountId, headers, writerGeneration, mainWriter, { modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined });
   };
 }
 
@@ -1201,6 +1299,10 @@ interface CodexPoolAccountRetryArgs {
     translatorBudget: TranslatorBudget;
     turnAdmissionLease?: AdmissionLease;
     resolveCodexModelEntitlements?: typeof resolveCodexModelEntitlements;
+    /** The logical request's execution budget: the account move is its fourth send. */
+    sendBudget?: TransientSendBudget;
+    /** Root workflow this turn belongs to, so the move is charged there as well. */
+    workflowRootId?: string;
   };
   firstAuthCtx: Extract<CodexAuthContext, { kind: "pool" | "main-pool" }>;
   firstResponse: Response;
@@ -1395,6 +1497,27 @@ async function retryCodexPoolOnAlternateAccount(
     recordUnmovedTransientOutcome();
     return { kind: "no-alternate" };
   }
+  // An account move is the guarded profile's fourth send and draws the single shared
+  // final-recovery reserve. Nothing bounded it per request before: `excludeAccountId` excludes
+  // only the account that just failed, and the caller's recovery loop can return here after the
+  // alternate fails too, so one request could walk the pool an account at a time. The permit is
+  // consumed immediately before the physical send, so a resolution that finds no alternate
+  // costs nothing.
+  const executionBudget = isRequestExecutionBudget(args.options.sendBudget)
+    ? args.options.sendBudget
+    : undefined;
+  let accountMovePermit: SingleUseDispatchPermit | undefined;
+  if (!retryAuthCtx && executionBudget) {
+    const decision = executionBudget.reserveDispatch({
+      sendClass: "account-failover",
+      targetKey: `${route.providerName}|${route.modelId}|alternate-account`,
+    });
+    if (!decision.allowed) {
+      recordUnmovedTransientOutcome();
+      return { kind: "no-alternate" };
+    }
+    accountMovePermit = decision.permit;
+  }
   try {
     retryAuthCtx ??= await resolveCodexAuthContext(
         callerAuthHeaders,
@@ -1455,7 +1578,7 @@ async function retryCodexPoolOnAlternateAccount(
       firstResponse.headers,
       firstAuthCtx.writerGeneration,
       firstAuthCtx.kind === "main-pool" ? firstAuthCtx.mainQuotaWriter : undefined,
-      { modelId: route.modelId },
+      { modelId: route.modelId, poolWriter: firstAuthCtx.kind === "pool" ? firstAuthCtx.poolQuotaWriter : undefined },
     );
   }
   const deferFirstOutcome = shouldDeferCodexResetDerivedCooldown(
@@ -1533,6 +1656,18 @@ async function retryCodexPoolOnAlternateAccount(
   let upstreamResponse: Response;
   try {
     while (true) {
+      // The same-account gated-model 400 ladder below keeps its own `maxRetrySends` bound and
+      // does not take the reserve again; only the move itself does.
+      if (accountMovePermit) {
+        const charged = accountMovePermit.use();
+        accountMovePermit = undefined;
+        if (!charged) {
+          recordUnmovedTransientOutcome();
+          return { kind: "no-alternate" };
+        }
+        // The move is a physical send like any other, so the root workflow is charged too.
+        chargeWorkflowSends(args.options.workflowRootId, 1);
+      }
       noteAttemptSend(logCtx.activeAttempt, passthroughEstimate);
       try {
         upstreamResponse = await fetchWithHeaderTimeout(
@@ -1816,6 +1951,12 @@ export interface HandleResponsesOptions {
   onStoredPool401ReplayDispatched?: () => void;
   /** Caller-owned for Chat/Claude replay; omitted only at genuine Responses ingress. */
   translatorBudget?: TranslatorBudget;
+  /**
+   * Transient sends already spent by this logical request. Combo children inherit the parent's
+   * holder through the options spread, so a fan-out shares one allowance instead of taking a
+   * fresh one per target (#4546).
+   */
+  sendBudget?: TransientSendBudget;
   /**
    * Terminal vision-describe marker (roadmap 180): true when the inbound
    * request IS the vision sidecar's own loopback describe call. The plan site
@@ -2429,6 +2570,7 @@ async function refreshPoolForwardAuth(args: {
       accessToken: refreshed.accessToken,
       chatgptAccountId: refreshed.chatgptAccountId,
       generation: refreshed.generation,
+      poolQuotaWriter: capturePoolQuotaWriter(authCtx.accountId, refreshed),
     };
     const provider = applyCodexAuthContextToProvider(
       stripCodexRuntimeProviderFields(route.provider),
@@ -2578,6 +2720,19 @@ async function applyFinalRouteRequestNormalization(args: {
   route.provider = resolveOpenCodeGoTransport(route.provider,
     args.claudeGoAffinity ? args.claudeGoAffinity.sessionLane : getOrAllocateRequestSessionLane(req));
   route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire);
+  parsed._plaintextV2AgentMessages = shouldPreparePlaintextV2AgentMessages({
+    enabled: config.plaintextV2AgentMessages === true,
+    inboundWire,
+    canonicalChatGpt: isCanonicalOpenAiForwardProvider(route.provider),
+    requestBody: parsed._rawBody,
+  });
+  // Recompute from the original wire preference on every route, including fallback.
+  // A provider default never converts raw reasoning into a summary.
+  if (inboundWire === "responses" && parsed._rawBody) {
+    const summary = (parsed._rawBody as { reasoning?: { summary?: unknown } }).reasoning?.summary;
+    parsed.options.hideThinkingSummary = summary === "none"
+      || (!summary && route.provider.showThinkingSummary !== true);
+  }
   if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = route.modelId;
   logCtx.provider = route.providerName;
@@ -2933,6 +3088,7 @@ export async function handleComboResponses(
       pick.target,
       comboDefaultEffort(config, comboId),
       supportedLadderFor({ provider: targetRoute.provider, modelId: targetRoute.modelId }),
+      combo.reasoningEffortMode,
     );
     const childHeaders = buildComboChildHeaders(req.headers);
     const childRequest = new Request(req.url, {
@@ -3347,6 +3503,9 @@ export async function handleResponses(
       visionDescribeTerminal: options.visionDescribeTerminal === true
         || req.headers.get("x-opencodex-vision-describe") === "1",
       translatorBudget,
+      // Created once at genuine ingress; a combo child arrives with the parent's holder already
+      // in options and must not start a fresh allowance.
+      sendBudget: options.sendBudget ?? createRequestExecutionBudget(),
     });
     return ownsBudget ? finalizeOwnedTranslatorBudget(response, translatorBudget) : response;
   } catch (error) {
@@ -3953,6 +4112,49 @@ async function handleResponsesInner(
     return unreadableEncryptedAgentTaskResponse(recoveryFailureReason);
   }
 
+  // The guard above asks whether the CURRENT worker task is readable, and it only inspects the
+  // tail item. An `agent_message` that mixes readable text with backend ciphertext answers
+  // "readable" to that question at every position, so it passed -- and then
+  // `normalizeRoutedAgentMessages` refused to lower it, because lowering requires every part to
+  // be representable. The raw Responses passthrough serialized the private item as it stood, so
+  // backend ciphertext and an item type only the Codex backend declares reached a third-party
+  // provider, which answered `422 unknown item type "agent_message"` (#4454).
+  //
+  // The opaque-blob path already knows the repair: replace the undecryptable part with an
+  // omission marker, which leaves the item lowerable. It applied that repair only AFTER an
+  // upstream rejection. For a destination that cannot accept the private item under any
+  // circumstances, that round trip was never going to succeed and sent the ciphertext to find
+  // out, so do the repair here instead. Recovery above has already had its chance to turn the
+  // same bytes into real plaintext; only what it could not rescue reaches this.
+  if (inboundWire === "responses" && !finalRouteCanPassThroughEncryptedTask) {
+    // Only the raw Responses passthrough puts input items on the wire verbatim, so that is the
+    // only wire this has to repair: translated wires rebuild the body from parsed messages, where
+    // `inputContentParts` drops an encrypted part instead of forwarding it. The exemption is the
+    // canonical Codex backend alone, because it is the one destination that minted these bytes and
+    // can read them. `authMode: "forward"` is NOT that test -- a noncanonical forward gateway is
+    // somebody else's server that happens to be configured for passthrough, and it receives the
+    // ciphertext like any other third party.
+    //
+    // Combo children run this too. Each child carries its own `structuredClone` of the body
+    // (`concreteComboRequestBody`) and its own concrete route, so a sibling's repair is invisible
+    // here and a target that resolves to a routed Responses wire would otherwise send the
+    // ciphertext that the parent's own dispatch no longer does.
+    const wireProvider = resolveWireProtocolOverride(
+      route.providerName,
+      route.modelId,
+      route.provider,
+      inboundWire,
+    );
+    if (wireProvider.adapter === "openai-responses" && !isCanonicalOpenAiForwardProvider(wireProvider)) {
+      const repaired = stripAgentMessageCiphertextInPlace((body as { input?: unknown } | undefined)?.input);
+      if (repaired > 0) {
+        console.warn(
+          `[opencodex] replaced ciphertext in ${repaired} replayed agent message(s) with an omission marker; the selected provider cannot read native ChatGPT ciphertext`,
+        );
+      }
+    }
+  }
+
   // The canonical ChatGPT backend rejects previous_response_id, so a local replay miss leaves no
   // safe way to recover the omitted history. Fail before auth, adapter construction, or upstream
   // I/O instead of stripping the id and silently forwarding a context-free delta (#702).
@@ -4071,6 +4273,13 @@ async function handleResponsesInner(
     ? `${route.providerName}-${route.codexAccountNamespace}`
     : formatCodexProviderForLog(route.providerName, codexLogAccountId(authCtx), config);
   logCtx.accountLogLabel = codexAuthContextLogLabel(authCtx, config);
+  // A move is the expensive event: it discards the prefix warmed on the previous account. Record
+  // it as an event with its cause, so the operator reads it off one line instead of inferring it
+  // from account labels across many (#4546).
+  if (authCtx.kind === "pool" && authCtx.affinityDecision) {
+    logCtx.affinity = authCtx.affinityDecision.move;
+    logCtx.affinityReason = authCtx.affinityDecision.reason;
+  }
   // Seed an account-derived scope before final adapter binding. Cursor never treats it as
   // authoritative: bindRouteReasoningReplayScope replaces it with the exact route owner or a
   // per-request fail-closed sentinel after the final provider and credential are known.
@@ -4653,9 +4862,10 @@ async function handleResponsesInner(
   const routedCompaction = parsed._compactionRequest === true
     && !isCanonicalOpenAiForwardProvider(route.provider);
   const needsOpenAiVision = !visionDescribeTerminal
-    && shouldResolveOpenAiVisionSidecar(config, route.provider, route.modelId, parsed);
+    && shouldResolveOpenAiVisionSidecar(config, route.provider, route.modelId, parsed, route.providerName);
   const needsOpenAiSearch = !routedCompaction && !adapter.runTurn
-    && shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough);
+    && (shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough)
+      || shouldResolveOpenAiPassthroughWebSearchBridge(route.provider, parsed, isPassthrough));
   if (needsOpenAiVision || needsOpenAiSearch) {
     try {
       const candidates = listOpenAiForwardSidecarCandidates(config);
@@ -4722,7 +4932,7 @@ async function handleResponsesInner(
   const visionPlan = visionDescribeTerminal
     ? undefined
     : planVisionSidecar(config, route.provider, route.modelId, parsed, openAiSidecar, {
-      admission: options.admission, codexAuthPolicy: options.codexAuthPolicy,
+      admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
     });
   const recordSidecarOutcome = openAiSidecar?.recordOutcome;
   if (visionPlan) {
@@ -4734,9 +4944,9 @@ async function handleResponsesInner(
       recordSidecarOutcome,
       translatorBudget,
     );
-  } else if (isModelTextOnly(route.provider, route.modelId)) {
-    // Sidecar-covered model but NO plan (no forward provider / missing forwarded auth / sidecar
-    // disabled): fail closed — never forward raw images to a text-only upstream.
+  } else if (requiresVisionPreprocessing(config, route.provider, route.modelId, route.providerName)) {
+    // Image capability is not positively proven but no sidecar plan is dispatchable: fail closed.
+    // Never forward raw image bytes to an unverified upstream.
     stripImagesInPlace(parsed, translatorBudget);
   }
 
@@ -4810,16 +5020,90 @@ async function handleResponsesInner(
   }
 
   let routedNamespaceToolAliases: RoutedNamespaceToolAliases = new Map();
+  let plaintextV2AgentMessageToolNames: ReadonlySet<string> = new Set();
+  let plaintextV2AgentMessageAliasedToolNames: ReadonlySet<string> = new Set();
   let routedMuseToolNameAliases: MuseToolNameAliases = new Map();
-  const refreshRoutedNamespaceToolAliases = (builtRequest: AdapterRequest): void => {
+  const refreshRequestToolAliases = (builtRequest: AdapterRequest): void => {
     routedNamespaceToolAliases = builtRequest.convertedRoutedNamespaceToolAliases ?? new Map();
+    plaintextV2AgentMessageToolNames = builtRequest.plaintextV2AgentMessageToolNames ?? new Set();
+    plaintextV2AgentMessageAliasedToolNames = builtRequest.plaintextV2AgentMessageAliasedToolNames ?? new Set();
     routedMuseToolNameAliases = builtRequest.convertedMuseToolNameAliases ?? new Map();
   };
+
+  // One transient-retry budget for the whole LOGICAL request, read ABOVE the passthrough branch
+  // so that branch shares it too. It used to be a local declared below, which put it in the
+  // temporal dead zone for the passthrough sends and left each recovery leg taking the helper's
+  // fresh default of 3. It is now a holder carried on options, so a combo child inherits the
+  // parent's spend instead of starting over per target -- both halves of the measured
+  // amplification in #4546.
+  const sendBudget = options.sendBudget ?? createRequestExecutionBudget();
+  // The root workflow is the user-visible task. A per-request cap cannot bound a fan-out that
+  // sends once per child seven hundred times, so every send charged to the request is charged
+  // to the root as well (#4546).
+  const workflowRootId = req.headers.get("x-codex-parent-thread-id")?.trim() || undefined;
+  const noteTransientSends = (used: number): void => {
+    const charged = Math.max(0, used);
+    sendBudget.used += charged;
+    chargeWorkflowSends(workflowRootId, charged);
+  };
+  // Refused before any dispatch, and deliberately not by evicting the root's ledger entry:
+  // dropping the record to make room would hand the fan-out a fresh allowance, which is the
+  // laundering this ceiling exists to stop. The client is told the task needs a new grant
+  // rather than being given a synthetic upstream error.
+  if (workflowSendCeilingReached(workflowRootId)) {
+    return formatErrorResponse(
+      429,
+      "workflow_budget_exhausted",
+      "This task has used its whole send budget, so no further upstream request was made. Requests already in flight settle as they finish.",
+    );
+  }
+  // No floor. Math.max(1, ...) meant an exhausted request still funded one send on every
+  // recovery leg, so a bounded per-leg allowance never became a bounded per-request one.
+  const remainingTransientSendBudget = (budget: number): number =>
+    isRequestExecutionBudget(sendBudget)
+      ? sendBudget.remainingBaseSends(budget)
+      : Math.max(0, budget - sendBudget.used);
+  // The adapter contract needs the full budget, not just the counter. options.sendBudget is
+  // typed as the narrow holder so a caller that predates this can still pass one, so narrow it
+  // once here rather than asserting at each adapter call site.
+  const adapterSendBudget = isRequestExecutionBudget(sendBudget) ? sendBudget : undefined;
+  const sendBudgetExhausted = (): boolean =>
+    remainingTransientSendBudget(TRANSIENT_RETRY_MAX_ATTEMPTS) === 0;
+  /**
+   * How many sends a recovery leg may make, and the permit that authorises the last one.
+   *
+   * The base allowance is spent first. Once it is gone a recovery class may still draw the
+   * single shared final-recovery reserve -- which is what keeps the validated sanitized rebuild
+   * after a 5xx streak alive at four total sends -- but an account move and a rebuild cannot
+   * each take one. `countedExternally` is set because these legs run through the retry helper,
+   * which reports the same send again through `onSendsConsumed`.
+   */
+  const recoverySendAllowance = (
+    cap: number,
+    sendClass: SendClass,
+    targetKey: string,
+  ): { attempts: number; permit?: SingleUseDispatchPermit } => {
+    const base = remainingTransientSendBudget(cap);
+    if (base > 0) return { attempts: base };
+    if (!isRequestExecutionBudget(sendBudget)) return { attempts: 0 };
+    const decision = sendBudget.reserveDispatch({ sendClass, targetKey, countedExternally: true });
+    return decision.allowed ? { attempts: 1, permit: decision.permit } : { attempts: 0 };
+  };
+  /**
+   * Both classes share the one reserve, so this only changes what the decision is called --
+   * but a recovery event that says "repair" when a credential refresh drove it is the kind of
+   * mislabelled evidence #4592 existed to stop.
+   */
+  const recoveryClassFor = (recovery: AttemptRecoveryKind): SendClass =>
+    /401|429|oauth|rate-limit|key/.test(recovery) ? "auth-recovery" : "repair";
 
   if ("passthrough" in adapter && adapter.passthrough && !routedCompaction) {
     let hostAdmissionLease = pendingHostAdmissionLease;
     pendingHostAdmissionLease = null;
     try {
+    const codexSafetyBufferingOptions = isCanonicalOpenAiForwardProvider(route.provider)
+      ? codexSafetyBufferingFilterOptions(config)
+      : undefined;
     const imageGenCallAliases = route.provider.authMode === "forward"
       ? new Map<string, { namespace: string; name: string }>()
       : imageGenToolCallAliases(toolBridgeMaps.toolNsMap, parsed._rawBody, translatorBudget);
@@ -4910,7 +5194,7 @@ async function handleResponsesInner(
       // would incorrectly disable restoration for the exact ambiguous-name case the alias fixes.
       routedToolSearchNames.add(name);
     }
-    refreshRoutedNamespaceToolAliases(request);
+    refreshRequestToolAliases(request);
     // #1700: the bridged paths refuse a call to a tool the request never declared
     // (`declaredToolNames`, src/bridge.ts). The passthrough had no equivalent, so a routed
     // provider's top-level `apply_patch` — which under Codex code mode exists only as a nested
@@ -5016,7 +5300,7 @@ async function handleResponsesInner(
           // `buildToolBridgeMaps` also aliases a namespaced tool under its bare name when the
           // caller's `tool_choice` selected it unambiguously, which the bridge needs to route the
           // call back. For `exec` alone that alias would also switch on nested-helper
-          // normalization and re-authorize `exec_command`/`shell_command`/`apply_patch`, so it is
+          // normalization and re-authorize `exec_command`/`shell_command`/`apply_patch`/`view_image`, so it is
           // admitted here only when the caller's own catalog declared a bare `exec`. Selecting an
           // MCP `exec` is not a declaration of the code-mode shell tool.
           if (
@@ -5098,7 +5382,7 @@ async function handleResponsesInner(
       }
       // The snapshot callback opts the inspector into output reconstruction. Compaction
       // has no continuation cache, so use the parsed terminal here without adding retention.
-      if (!rememberPassthroughResponse && payload && typeof payload === "object"
+      if (plaintextV2AgentMessageToolNames.size === 0 && !rememberPassthroughResponse && payload && typeof payload === "object"
         && "type" in payload && payload.type === "response.completed"
         && "response" in payload && payload.response && typeof payload.response === "object"
         && !Array.isArray(payload.response)) {
@@ -5120,14 +5404,16 @@ async function handleResponsesInner(
         routedCustomToolRepairNames,
         declaredWireToolNames,
       ).value;
-      const restoredResponse = (functionRepairSchemas.size > 0
+      const normalizedResponse = (functionRepairSchemas.size > 0
         ? JSON.parse(normalizeFunctionCompletionJson(JSON.stringify(restored)))
         : restored) as { id?: unknown; output?: unknown; status?: unknown };
+      const plaintextRestore = restorePlaintextV2AgentMessageCalls(
+        normalizedResponse, plaintextV2AgentMessageToolNames, plaintextV2AgentMessageAliasedToolNames,
+      );
+      if (plaintextRestore.overflowed) return;
+      const restoredResponse = plaintextRestore.value as typeof normalizedResponse;
       // Replay overlap compares the items the client echoes, including visible reasoning shape.
-      const replayResponse = parsed.options.hideThinkingSummary !== true
-        && routeUsesContentChannelReasoning(route.provider, route.modelId)
-        ? rewriteReasoningSummaryInJson(restoredResponse) as typeof restoredResponse
-        : restoredResponse;
+      const replayResponse = restoredResponse;
       if (
         undeclaredToolGuardActive
         && undeclaredToolCallNameInResponse(
@@ -5204,6 +5490,22 @@ async function handleResponsesInner(
       }
       hostAdmissionLease = null;
     };
+    /**
+     * #4191: a Codex WS exchange pins its content-free stage record on the
+     * Response it resolves (markCodexWsStage). Adopting the record here, at
+     * the single funnel every physical upstream response passes through,
+     * binds it to the attempt that actually served it — including the 502/504
+     * pre-response JSON settles that never reach the SSE relay.
+     */
+    const adoptCodexWsStage = (response: Response): void => {
+      const stage = readCodexWsStage(response);
+      if (stage && logCtx.activeAttempt) logCtx.activeAttempt.codexWsStage = stage;
+    };
+    const adoptObservedResponse = <T extends Response>(response: T): T => {
+      settleObservedHostResponse();
+      adoptCodexWsStage(response);
+      return response;
+    };
     let passthroughEstimate = typeof request.usageLog?.inputTokens === "number"
       ? request.usageLog.inputTokens
       : undefined;
@@ -5266,6 +5568,15 @@ async function handleResponsesInner(
         hostAdmissionLease = null;
         releaseCodexAuthContextProbeLease(authCtx);
         return clientCancelledResponse();
+      }
+      // A budget refusal is a proxy decision, not an upstream fault. Reporting it as
+      // 502 upstream_error would blame the provider for a limit this process applied, and
+      // would record a fake reachability failure against the account's health.
+      if (err instanceof SendBudgetExhaustedError) {
+        releaseUpstreamHostAdmission(hostAdmissionLease);
+        hostAdmissionLease = null;
+        releaseCodexAuthContextProbeLease(authCtx);
+        return formatErrorResponse(429, "request_send_budget_exhausted", err.message);
       }
       const localRefusal = mapCodexAuthContextErrorToResponse(unwrapUpstreamRetryEvidenceError(err), {
         now: Date.now(), accountSelector: route.codexAccountNamespace,
@@ -5335,12 +5646,9 @@ async function handleResponsesInner(
             route.provider.authMode === "forward")
             // Every real attempt response — including an intermediate 5xx the
             // retry wrapper replaces — proves the host was reached (#914 review).
-            .then(res => {
-              settleObservedHostResponse();
-              return res;
-            });
+            .then(adoptObservedResponse);
         },
-        { abortSignal: upstream.signal, label: safeHostLabel(request.url) },
+        { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(TRANSIENT_RETRY_MAX_ATTEMPTS), onSendsConsumed: noteTransientSends },
       );
     } catch (err) {
       return transportFailureResponse(err);
@@ -5349,8 +5657,13 @@ async function handleResponsesInner(
     }
 
     const opaqueBlobRecoveryGuard: OpaqueBlobRecoveryGuard = { attempted: false };
+    // At most one reasoning-effort downgrade per request.
+    const reasoningEffortDowngradeGuard: { attempted: boolean } = { attempted: false };
     let oauth401ReplayAttempted = false;
     let codex401ReplayKind: "main" | "stored" | null = null;
+    // Console Go answers a transient 400 "Invalid upload request." for bodies it accepts
+    // moments later; at most one byte-identical replay is allowed per request.
+    const consoleGoUploadRetryGuard: { attempted: boolean } = { attempted: false };
     const rateLimitPolicy = rateLimitRetryPolicyFor(route.provider);
     let rateLimitRetries = 0;
     const rebuildAndRefetch = async (
@@ -5365,11 +5678,13 @@ async function handleResponsesInner(
         return { failed: formatErrorResponse(502, "upstream_error", "Recovery changed the provider wire unexpectedly") };
       }
       try {
-        request = await retryAdapter.buildRequest(parsed, {
-          headers: selectedForwardHeaders,
-          translatorBudget,
-        });
-        refreshRoutedNamespaceToolAliases(request);
+        if (recovery !== "console-go-upload-retry") {
+          request = await retryAdapter.buildRequest(parsed, {
+            headers: selectedForwardHeaders,
+            translatorBudget,
+          });
+        }
+        refreshRequestToolAliases(request);
         recordAdapterReasoning(logCtx, request);
         recordAdapterTier(logCtx, request);
       } catch (err) {
@@ -5394,8 +5709,21 @@ async function handleResponsesInner(
       const rebuiltBodyRefusal = refuseOversizedOutboundBody(request);
       if (rebuiltBodyRefusal) return { failed: rebuiltBodyRefusal };
       try {
+        // The base allowance is spent first; once it is gone this leg may still draw the one
+        // shared final-recovery reserve, which is what keeps a validated sanitized rebuild
+        // after a 5xx streak alive at four total sends instead of dying at three.
+        const allowance = recoverySendAllowance(
+          TRANSIENT_RETRY_MAX_ATTEMPTS,
+          recoveryClassFor(recovery),
+          `${route.providerName}|${route.modelId}|${recovery}`,
+        );
         return await fetchWithTransientRetry(
           innerRecovery => {
+            // Gated on the return, not fire-and-forget: a consumed permit means this leg
+            // already sent once, and letting the second call through would be a free send.
+            if (allowance.permit && !allowance.permit.use()) {
+              throw new SendBudgetExhaustedError(safeHostLabel(request.url));
+            }
             noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, innerRecovery ?? recovery);
             return fetchWithHeaderTimeout(request.url, applyUpstreamRecoveryInit({
               method: request.method,
@@ -5411,12 +5739,9 @@ async function handleResponsesInner(
                   ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
               }),
               route.provider.authMode === "forward")
-              .then(response => {
-                settleObservedHostResponse();
-                return response;
-              });
+              .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url) },
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: allowance.attempts, onSendsConsumed: noteTransientSends },
         );
       } catch (err) {
         return { failed: transportFailureResponse(err) };
@@ -5486,7 +5811,7 @@ async function handleResponsesInner(
           headers: selectedForwardHeaders,
           translatorBudget,
         });
-        refreshRoutedNamespaceToolAliases(request);
+        refreshRequestToolAliases(request);
         recordAdapterReasoning(logCtx, request);
         recordAdapterTier(logCtx, request);
         refreshUndeclaredToolGuard(request);
@@ -5519,10 +5844,7 @@ async function handleResponsesInner(
             codex401ReplayKind === "stored" ? options.onStoredPool401ReplayDispatched : undefined,
           ),
           route.provider.authMode === "forward",
-        ).then(response => {
-          settleObservedHostResponse();
-          return response;
-        });
+        ).then(adoptObservedResponse);
       } catch (err) {
         return transportFailureResponse(err);
       } finally {
@@ -5542,6 +5864,10 @@ async function handleResponsesInner(
       && isOAuth401ReplayProvider
       && sentOAuthSnapshot
       && !oauth401ReplayAttempted
+      // Refused here, before the 401 body is cancelled: once it is gone the request can only
+      // answer with a synthetic 502, which would report a proxy budget decision as an upstream
+      // fault and throw away the credential evidence the client needs.
+      && !sendBudgetExhausted()
     ) {
       oauth401ReplayAttempted = true;
       try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
@@ -5607,7 +5933,7 @@ async function handleResponsesInner(
           headers: selectedForwardHeaders,
           translatorBudget,
         });
-        refreshRoutedNamespaceToolAliases(request);
+        refreshRequestToolAliases(request);
         recordAdapterReasoning(logCtx, request);
         recordAdapterTier(logCtx, request);
       } catch (err) {
@@ -5637,12 +5963,9 @@ async function handleResponsesInner(
                   ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
               }),
               route.provider.authMode === "forward")
-              .then(res => {
-                settleObservedHostResponse();
-                return res;
-              });
+              .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url) },
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(TRANSIENT_RETRY_MAX_ATTEMPTS), onSendsConsumed: noteTransientSends },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -5695,6 +6018,10 @@ async function handleResponsesInner(
       upstreamResponse.status === 429
       && rateLimitPolicy !== null
       && rateLimitRetries < rateLimitPolicy.attempts
+      // Checked here rather than inside the helper: prepareSameTarget429Wait releases the 429
+      // body, so a refusal discovered after the wait can no longer return the real rate-limit
+      // answer and would surface a synthetic 502 instead.
+      && !sendBudgetExhausted()
     ) {
       rateLimitRetries += 1;
       // Release unread body + deliberate wait via the shared same-target helper.
@@ -5737,12 +6064,9 @@ async function handleResponsesInner(
                   ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
               }),
               route.provider.authMode === "forward")
-              .then(res => {
-                settleObservedHostResponse();
-                return res;
-              });
+              .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url) },
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(TRANSIENT_RETRY_MAX_ATTEMPTS), onSendsConsumed: noteTransientSends },
         );
       } catch (err) {
         return transportFailureResponse(err);
@@ -5809,7 +6133,7 @@ async function handleResponsesInner(
           route,
           parsed,
           logCtx,
-          options,
+          options: { ...options, workflowRootId },
           firstAuthCtx: authCtx,
           firstResponse: upstreamResponse,
           outcomeStatus: poolRetryOutcome,
@@ -5819,6 +6143,7 @@ async function handleResponsesInner(
           passthroughEstimate,
           stream: parsed.stream,
           onResponse: (response, retryAuthCtx, retryRequest) => {
+            adoptCodexWsStage(response);
             captureAffinityResponse(
               response,
               retryAuthCtx,
@@ -5834,7 +6159,7 @@ async function handleResponsesInner(
         if (retry.kind === "retried") {
           authCtx = retry.authCtx;
           request = retry.request;
-          refreshRoutedNamespaceToolAliases(request);
+          refreshRequestToolAliases(request);
           refreshUndeclaredToolGuard(request);
           upstreamResponse = retry.upstreamResponse;
           selectedForwardHeaders = retry.selectedForwardHeaders;
@@ -5902,9 +6227,68 @@ async function handleResponsesInner(
         logCtx.terminalIncompleteReason = preflightLog.terminalIncompleteReason;
       }
     }
+    // Console Go (opencode-zen / opencode-go) intermittently rejects a body it accepts seconds
+    // later with 400 invalid_request_error / "Invalid upload request." Replay the byte-identical
+    // request once after the exact gateway rejection. Single-shot guard.
+    // This recovery reuses the captured request; other recovery kinds still rebuild.
+    if (!consoleGoUploadRetryGuard.attempted) {
+      const uploadRejectionBody = await consoleGoUploadRejectionBody(
+        upstreamResponse,
+        consoleGoUploadRetryGuard.attempted,
+        upstream.signal,
+      );
+      if (uploadRejectionBody !== undefined
+        && isTransientConsoleGoUploadRejection({
+          status: upstreamResponse.status,
+          errorBody: uploadRejectionBody,
+          outboundUrl: request.url,
+        })) {
+        consoleGoUploadRetryGuard.attempted = true;
+        try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+        if (!upstream.signal.aborted) {
+          try {
+            await sleepWithAbort(CONSOLE_GO_UPLOAD_RETRY_DELAY_MS, upstream.signal);
+          } catch { return clientCancelledResponse(); }
+        }
+        if (upstream.signal.aborted) return clientCancelledResponse();
+        const result = await rebuildAndRefetch("console-go-upload-retry");
+        if ("failed" in result) return result.failed;
+        upstreamResponse = result;
+        continue passthroughRecovery;
+      }
+    }
+    // Reasoning-effort downgrade: a rung the catalog still advertises can be refused upstream --
+    // the metadata records the model's ladder, not this account's entitlement (a Muse Code
+    // subscription gates max on muse-spark-1.3-contributor, for example). Learn the refusal so
+    // later turns clamp before dispatch, then replay once at the next lower published rung
+    // instead of failing the turn; requestedEffort/effectiveEffort keep both values in usage.
+    if (!reasoningEffortDowngradeGuard.attempted) {
+      const rejectionText = await reasoningEffortRejectionText(
+        upstreamResponse,
+        reasoningEffortDowngradeGuard.attempted,
+        upstream.signal,
+      );
+      const downgrade = rejectionText === undefined
+        ? undefined
+        : planReasoningEffortDowngrade({
+            provider: route.provider,
+            modelId: parsed.modelId,
+            requested: parsed.options.reasoning,
+            rejectionText,
+          });
+      if (downgrade) {
+        reasoningEffortDowngradeGuard.attempted = true;
+        parsed.options.reasoning = downgrade.effort;
+        try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+        const result = await rebuildAndRefetch("reasoning-effort-downgrade");
+        if ("failed" in result) return result.failed;
+        upstreamResponse = result;
+        continue passthroughRecovery;
+      }
+    }
     break;
     }
-    const headers = sanitizePassthroughHeaders(upstreamResponse.headers);
+    const headers = sanitizePassthroughHeaders(upstreamResponse.headers, codexSafetyBufferingOptions);
     const resolvedModel = headers.get("openai-model")?.trim();
     if (resolvedModel && !logCtx.preserveResolvedModelFromRoute) logCtx.resolvedModel = resolvedModel;
     if (isUsageDebugEnabled()) {
@@ -5915,7 +6299,7 @@ async function handleResponsesInner(
     // treating a successful body as SSE when the caller requested streaming.
     const passthroughCt = headers.get("content-type")?.toLowerCase();
     const isEventStream = passthroughCt?.includes("text/event-stream")
-      || (upstreamResponse.ok && !!upstreamResponse.body && !passthroughCt && parsed.stream);
+      || (plaintextV2AgentMessageToolNames.size === 0 && upstreamResponse.ok && !!upstreamResponse.body && !passthroughCt && parsed.stream);
     const recordTerminalOutcome = codexForwardTerminalOutcomeRecorder(
       config,
       authCtx,
@@ -5941,7 +6325,7 @@ async function handleResponsesInner(
       if (!isCodexWsQuotaObservedResponse(upstreamResponse)) {
         applyAccountQuotaFromUpstreamHeaders(authCtx.accountId, upstreamResponse.headers,
           authCtx.writerGeneration, authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
-          { modelId: route.modelId });
+          { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined });
       }
       if (terminalBodyWillRecord) {
         options.setTerminalOutcomeRecorder?.((status, httpStatusOverride) => {
@@ -5993,7 +6377,7 @@ async function handleResponsesInner(
       return new Response(upstreamResponse.body, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
-        headers: sanitizePassthroughHeaders(upstreamResponse.headers),
+        headers: sanitizePassthroughHeaders(upstreamResponse.headers, codexSafetyBufferingOptions),
       });
     }
     if (!upstreamResponse.ok) {
@@ -6051,10 +6435,19 @@ async function handleResponsesInner(
       // conversation upstream, and hands back ordinary Responses SSE — so every rewrite below,
       // including the guard itself, still inspects the client-facing stream. Default OFF: without
       // the opt-in this is one planner call and the relay is byte-identical to before.
+      const webSearchBridgeAuth = resolvePassthroughWebSearchBridgeAuth(
+        route.provider.webSearchBridge?.backend,
+        config,
+        openAiSidecar,
+      );
       const webSearchBridgePlan = planPassthroughWebSearchBridge(parsed, route.provider, {
+        providerName: route.providerName,
         isPassthrough: true,
         stream: parsed.stream === true,
+        auth: webSearchBridgeAuth,
       });
+      // Capture the binding that actually served the first leg, after its permitted reselection.
+      const webSearchBridgeBinding = requestBindings.get(request);
       // The bridge wraps the RAW upstream body, so terminal repair below still owns the single
       // client-facing terminal — the bridge drops the terminal of every intercepted leg.
       const upstreamSseBody = webSearchBridgePlan
@@ -6072,13 +6465,26 @@ async function handleResponsesInner(
             connectMs,
             true,
             providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-              dispatchOverride: oauthDispatch(request),
+              // Pacing can outlive a manual selection change. A continuation must retain the
+              // first leg's key and appended search result, never rebuild from the original turn.
+              beforeDispatch: () => {
+                if (webSearchBridgeBinding?.kind !== "api-key"
+                  || !providerApiKeySelectionIsCurrent(config, route.providerName, webSearchBridgeBinding.provider)) {
+                  throw new Error("API key selection changed during a web-search continuation");
+                }
+              },
               providerName: route.providerName,
               modelId: route.modelId,
             }),
             false,
           ),
-          execute: createOllamaBridgeExecutor(webSearchBridgePlan, route.provider.apiKey ?? ""),
+          execute: createPassthroughWebSearchBridgeExecutor(webSearchBridgePlan, {
+            providerApiKey: route.provider.apiKey ?? "",
+            auth: webSearchBridgeAuth,
+            hostedTool: parsed._webSearch,
+            describeImages: requiresVisionPreprocessing(config, route.provider, route.modelId, route.providerName),
+            sidecar: config.webSearchSidecar,
+          }),
           // Appending a search result can push the continuation past the ceiling the first leg
           // was admitted under, so the same limit is re-applied before every later send.
           checkOutboundBody: (continuationBody: string) => {
@@ -6128,15 +6534,23 @@ async function handleResponsesInner(
           ? createResponsesItemIdPayloadRewrite(repairConfig!, translatorBudget)
           : undefined,
         responseModelRewrite,
-        parsed.options.hideThinkingSummary !== true
-          && routeUsesContentChannelReasoning(route.provider, route.modelId)
-          ? createReasoningSummaryChannelPayloadRewrite()
-          : undefined,
       ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
       // #893: sparse-snapshot gateways get field backfills AND lifecycle event
       // injection at the block level, after payload rewrites. Defaults come
       // from the finalized OUTBOUND body — the normalized internal tool shapes
       // are not the Responses wire shapes the snapshot must mirror.
+      // Only validated client blocks may publish plaintext continuation state.
+      // Raw inspection precedes rewriting on eager relays, so it cannot own this write.
+      const plaintextInspector = plaintextV2AgentMessageToolNames.size > 0
+        ? createSseInspector({ onCompletedResponse: rememberPassthroughResponseChecked })
+        : undefined;
+      const plaintextEncoder = plaintextInspector ? new TextEncoder() : undefined;
+      const rememberPlaintextBlock = plaintextInspector
+        ? Object.assign((block: string): readonly string[] => {
+          plaintextInspector.feed(plaintextEncoder!.encode(`${block}\n\n`));
+          return [block];
+        }, { dispose: () => plaintextInspector.dispose() })
+        : undefined;
       const blockRewrites = [
         payloadRewrites.length > 0
           ? payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites))
@@ -6164,6 +6578,11 @@ async function handleResponsesInner(
         snapshotRepairEnabled
           ? createResponsesSnapshotBlockRewrite(outboundRequestBody, translatorBudget)
           : undefined,
+        plaintextV2AgentMessageToolNames.size > 0
+          ? payloadRewriteAsBlockRewrite(createPlaintextV2AgentMessageCallRestoreRewrite(
+            plaintextV2AgentMessageToolNames, plaintextV2AgentMessageAliasedToolNames,
+          ))
+          : undefined,
         createResponsesFieldBackfillBlockRewrite(),
         functionRepairSchemas.size > 0
           ? createResponsesFunctionToolRepairBlockRewrite(functionRepairSchemas, translatorBudget)
@@ -6178,6 +6597,7 @@ async function handleResponsesInner(
             declaredBareWireToolNames,
           )
           : undefined,
+        rememberPlaintextBlock,
       ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
       const clientBlockRewrite = blockRewrites.length > 0
         ? composeSseBlockRewrites(...blockRewrites)
@@ -6225,7 +6645,7 @@ async function handleResponsesInner(
         const inspector = createSseInspector({
           onTerminal: reportNativeTerminal,
           logCtx,
-          onCompletedResponse: rememberPassthroughResponse ? rememberPassthroughResponseChecked : undefined,
+          onCompletedResponse: rememberPassthroughResponse && plaintextV2AgentMessageToolNames.size === 0 ? rememberPassthroughResponseChecked : undefined,
           onParsedPayload: noteInspectedPayload,
           onFirstOutput: options.onFirstOutput,
           pinCompletedResponseIdToFirstSeen: githubCopilotRepairEnabled,
@@ -6262,6 +6682,7 @@ async function handleResponsesInner(
           onDone: () => unregisterTurn(turnAc),
         }, {
           clientGoneSignal: options.abortSignal,
+          terminalBoundary: codexSafetyBufferingOptions,
           ...(inlineEagerRewrite ? { rewriteBudget: translatorBudget } : {}),
           ...(logCtx.upstreamError === undefined ? {} : { upstreamError: logCtx.upstreamError }),
         });
@@ -6324,7 +6745,7 @@ async function handleResponsesInner(
             responseCompletionCancelled = true;
             options.onNativePassthroughCancel?.();
           },
-          rememberPassthroughResponse ? rememberPassthroughResponseChecked : undefined,
+          rememberPassthroughResponse && plaintextV2AgentMessageToolNames.size === 0 ? rememberPassthroughResponseChecked : undefined,
           options.onFirstOutput,
           inspectionConsumerOptions,
         );
@@ -6334,7 +6755,7 @@ async function handleResponsesInner(
           logCtx,
           turnAc.signal,
           () => unregisterTurn(turnAc),
-          rememberPassthroughResponse ? rememberPassthroughResponseChecked : undefined,
+          rememberPassthroughResponse && plaintextV2AgentMessageToolNames.size === 0 ? rememberPassthroughResponseChecked : undefined,
           options.onFirstOutput,
           inspectionConsumerOptions,
         );
@@ -6353,7 +6774,7 @@ async function handleResponsesInner(
           responseCompletionCancelled = true;
           clientGone.abort(reason);
         },
-        { upstreamError: logCtx.upstreamError },
+        { upstreamError: logCtx.upstreamError, terminalBoundary: codexSafetyBufferingOptions },
       );
       return markNativePassthroughSseResponse(new Response(clientBody, {
         status: upstreamResponse.status,
@@ -6376,6 +6797,7 @@ async function handleResponsesInner(
       }
       const text = bounded.text;
       inspectResponseLogJson(logCtx, text);
+      let plaintextV2RestoreFailed = false;
       let clientJson = (() => {
         const restoredNamespace = restoreRoutedNamespaceCallsInJson(
           scrubSelfNamedToolCallNamespaceInJson(
@@ -6401,18 +6823,20 @@ async function handleResponsesInner(
           restored,
           routedToolSearchNames,
         );
-        const repaired = normalizeFunctionCompletionJson(restoredToolSearch);
+        const normalizedJson = normalizeFunctionCompletionJson(restoredToolSearch);
+        const plaintextRestore = restorePlaintextV2AgentMessageCallsInJsonResult(
+          normalizedJson, plaintextV2AgentMessageToolNames, plaintextV2AgentMessageAliasedToolNames,
+        );
+        plaintextV2RestoreFailed = plaintextRestore.overflowed;
+        const repaired = plaintextRestore.value;
         const modelRewritten = parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId
           ? rewriteResponsesModelJson(repaired, parsed._responseModelId)
           : repaired;
-        // The bounded-JSON answer bypasses the SSE payload rewrite, so content-
-        // channel reasoning needs the same normalization here for the plain
-        // JSON answer and every reframed-SSE variant built from clientJson.
-        return parsed.options.hideThinkingSummary !== true
-          && routeUsesContentChannelReasoning(route.provider, route.modelId)
-          ? rewriteReasoningSummaryInJsonString(modelRewritten)
-          : modelRewritten;
+        return modelRewritten;
       })();
+      if (plaintextV2RestoreFailed) {
+        return formatErrorResponse(502, "upstream_error", PLAINTEXT_V2_AGENT_MESSAGE_RESTORE_OVERFLOW_MESSAGE);
+      }
       // #1700: same fail-closed policy as the SSE relay above. Both the plain JSON answer and
       // the reframed-SSE branch below are built from this body, so one check covers them. This
       // runs BEFORE the continuation cache write below: a refused turn must not become state a
@@ -6487,7 +6911,7 @@ async function handleResponsesInner(
             }
             throw error;
           }
-          const sseHeaders = sanitizePassthroughHeaders(headers);
+          const sseHeaders = sanitizePassthroughHeaders(headers, codexSafetyBufferingOptions);
           sseHeaders.set("content-type", "text/event-stream");
           sseHeaders.set("cache-control", "no-store");
           return new Response(stream, {
@@ -6519,6 +6943,10 @@ async function handleResponsesInner(
         statusText: upstreamResponse.statusText,
         headers,
       });
+    }
+    if (plaintextV2AgentMessageToolNames.size > 0) {
+      try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+      return formatErrorResponse(502, "upstream_error", "plaintext V2 agent-message response used an unsupported content type");
     }
     // An unclassified passthrough body is relayed directly and has no bounded completion observer;
     // use the same non-error-status success boundary as SSE instead of retaining per-stream state.
@@ -6580,7 +7008,7 @@ async function handleResponsesInner(
   //     can proceed for web-search-only turns
   const wsPlan = !routedCompaction
     ? planWebSearch(config, parsed, false, route.provider, route.modelId, openAiSidecar, {
-      admission: options.admission, codexAuthPolicy: options.codexAuthPolicy,
+      admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
     })
     : undefined;
   const imgPlan = !routedCompaction ? await planImageBridge(config, parsed, route.provider) : undefined;
@@ -7279,16 +7707,9 @@ async function handleResponsesInner(
     notifyResponseComplete(json);
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
-  // One request-scoped transient-retry budget owner, declared here so BOTH the initial send
-  // and the later recovery refetches (429, key/account rotation, OAuth replay) share it. A
-  // per-leg budget would let a request that recovers several times multiply upstream load.
-  let transientSendsUsed = 0;
-  const noteTransientSends = (used: number): void => { transientSendsUsed += Math.max(0, used); };
-  const remainingTransientSendBudget = (budget: number): number =>
-    Math.max(1, budget - transientSendsUsed);
   try {
     initialRequest = await activeAdapter.buildRequest(parsed, { headers: selectedForwardHeaders, translatorBudget });
-    refreshRoutedNamespaceToolAliases(initialRequest);
+    refreshRequestToolAliases(initialRequest);
     recordAdapterReasoning(logCtx, initialRequest);
     recordAdapterTier(logCtx, initialRequest);
     inputTokenEstimate = typeof initialRequest.usageLog?.inputTokens === "number"
@@ -7328,6 +7749,7 @@ async function handleResponsesInner(
       upstreamResponse = await activeAdapter.fetchResponse(builtInitialRequest, {
         abortSignal: upstream.signal,
         timeoutMs: connectMs,
+        sendBudget: adapterSendBudget,
         stream: parsed.stream,
         executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               dispatchOverride: oauthDispatch(builtInitialRequest),
@@ -7365,7 +7787,13 @@ async function handleResponsesInner(
           abortSignal: upstream.signal,
           label: safeHostLabel(builtInitialRequest.url),
           ...(transientPolicy
-            ? { attempts: transientPolicy.attempts, onSendsConsumed: noteTransientSends }
+            // Draws the remainder, not the raw policy. A combo child inherits the parent's
+            // holder but used to take a fresh full allowance on its own first send, so the
+            // shared counter was inherited without ever being read as a limit.
+            ? {
+              attempts: remainingTransientSendBudget(transientPolicy.attempts),
+              onSendsConsumed: noteTransientSends,
+            }
             : {}),
         },
       );
@@ -7397,7 +7825,14 @@ async function handleResponsesInner(
     // 413→429 rotation cannot silently undo the tightening.
     let imageRetryAttempted = false;
     const opaqueBlobRecoveryGuard: OpaqueBlobRecoveryGuard = { attempted: false };
+    // Console Go answers a transient 400 "Invalid upload request." for bodies it accepts
+    // moments later; at most one byte-identical replay is allowed per request.
+    const consoleGoUploadRetryGuard: { attempted: boolean } = { attempted: false };
     let oauth401ReplayAttempted = false;
+    // At most one reasoning-effort downgrade per request. This sits outside the recovery loop
+    // below for the same reason the two guards above do: a guard declared inside it is reset by
+    // every `continue recovery`, which would let one turn walk the whole ladder down.
+    const reasoningEffortDowngradeGuard: { attempted: boolean } = { attempted: false };
     /**
      * Rebuild the request from the current parsed input (and any image-tier bias) and refetch
      * it once, tagging the attempt with the given recovery kind. Rebuilds are deterministic
@@ -7433,7 +7868,7 @@ async function handleResponsesInner(
         sameTargetParsed = parsed;
         sameTargetToken = transportToken;
       }
-      refreshRoutedNamespaceToolAliases(retryRequest);
+      refreshRequestToolAliases(retryRequest);
       const retryEstimate = typeof retryRequest.usageLog?.inputTokens === "number"
         ? retryRequest.usageLog.inputTokens
         : undefined;
@@ -7449,6 +7884,7 @@ async function handleResponsesInner(
             return await activeAdapter.fetchResponse(retryRequest, {
               abortSignal: upstream.signal,
               timeoutMs: connectMs,
+            sendBudget: adapterSendBudget,
               stream: parsed.stream,
               executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               dispatchOverride: oauthDispatch(retryRequest),
@@ -7467,8 +7903,22 @@ async function handleResponsesInner(
           const refetchWithPolicy = (route.provider.adapter === "google" || refetchTransientPolicy)
             ? fetchWithTransientRetry
             : fetchWithResetRetry;
+          // Same rule as the passthrough rebuild: spend the base allowance first, then the one
+          // shared final-recovery reserve, so a recovery that follows a spent streak still gets
+          // its single send instead of dying at three.
+          const refetchAllowance = refetchTransientPolicy
+            ? recoverySendAllowance(
+              refetchTransientPolicy.attempts,
+              recoveryClassFor(recovery),
+              `${route.providerName}|${route.modelId}|${recovery}`,
+            )
+            : undefined;
           return await refetchWithPolicy(
-            recoveryKind => fetchWithHeaderTimeout(retryRequest.url,
+            recoveryKind => {
+              if (refetchAllowance?.permit && !refetchAllowance.permit.use()) {
+                throw new SendBudgetExhaustedError(safeHostLabel(retryRequest.url));
+              }
+              return fetchWithHeaderTimeout(retryRequest.url,
               applyUpstreamRecoveryInit({
                 method: retryRequest.method, headers: retryRequest.headers, body: retryRequest.body,
               }, recoveryKind), upstream.signal, connectMs, parsed.stream,
@@ -7476,13 +7926,14 @@ async function handleResponsesInner(
               dispatchOverride: oauthDispatch(retryRequest),
                 providerName: route.providerName,
                 modelId: route.modelId,
-              })),
+              }));
+            },
             {
               abortSignal: upstream.signal,
               label: safeHostLabel(retryRequest.url),
-              ...(refetchTransientPolicy
+              ...(refetchAllowance
                 ? {
-                  attempts: remainingTransientSendBudget(refetchTransientPolicy.attempts),
+                  attempts: refetchAllowance.attempts,
                   onSendsConsumed: noteTransientSends,
                 }
                 : {}),
@@ -7508,6 +7959,7 @@ async function handleResponsesInner(
         && isOAuth401ReplayProvider
         && sentOAuthSnapshot
         && !oauth401ReplayAttempted
+        && !sendBudgetExhausted()
       ) {
         oauth401ReplayAttempted = true;
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
@@ -7602,6 +8054,7 @@ async function handleResponsesInner(
         upstreamResponse.status === 429
         && rateLimitPolicy !== null
         && rateLimitRetries < rateLimitPolicy.attempts
+        && !sendBudgetExhausted()
       ) {
         rateLimitRetries += 1;
         // Release unread body + deliberate wait via the shared same-target helper.
@@ -7781,6 +8234,63 @@ async function handleResponsesInner(
         upstreamResponse = result;
         continue recovery;
       }
+      // Console Go (opencode-zen / opencode-go) intermittently rejects a body it accepts seconds
+      // later with 400 invalid_request_error / "Invalid upload request." Replay the
+      // byte-identical request once after the exact gateway rejection.
+      if (!consoleGoUploadRetryGuard.attempted) {
+        const uploadRejectionBody = await consoleGoUploadRejectionBody(
+          upstreamResponse,
+          consoleGoUploadRetryGuard.attempted,
+          upstream.signal,
+        );
+        if (uploadRejectionBody !== undefined
+          && isTransientConsoleGoUploadRejection({
+            status: upstreamResponse.status,
+            errorBody: uploadRejectionBody,
+            outboundUrl: sameTargetRequest?.url,
+          })) {
+          consoleGoUploadRetryGuard.attempted = true;
+          try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+          if (!upstream.signal.aborted) {
+            try {
+              await sleepWithAbort(CONSOLE_GO_UPLOAD_RETRY_DELAY_MS, upstream.signal);
+            } catch { cleanupUpstreamAbort(); return clientCancelledResponse(); }
+          }
+          if (upstream.signal.aborted) { cleanupUpstreamAbort(); return clientCancelledResponse(); }
+          const result = await rebuildAndRefetch("console-go-upload-retry");
+          if ("failed" in result) return result.failed;
+          upstreamResponse = result;
+          continue recovery;
+        }
+      }
+      // Reasoning-effort downgrade, mirroring the passthroughRecovery loop above: learn the
+      // refused rung, then replay once at the next published one.
+      if (!reasoningEffortDowngradeGuard.attempted) {
+        const rejectionText = await reasoningEffortRejectionText(
+          upstreamResponse,
+          reasoningEffortDowngradeGuard.attempted,
+          upstream.signal,
+        );
+        const downgrade = rejectionText === undefined
+          ? undefined
+          : planReasoningEffortDowngrade({
+              provider: route.provider,
+              modelId: parsed.modelId,
+              requested: parsed.options.reasoning,
+              rejectionText,
+            });
+        if (downgrade) {
+          reasoningEffortDowngradeGuard.attempted = true;
+          parsed.options.reasoning = downgrade.effort;
+          // The same-target cache keys on parsed identity, so a mutated effort needs a token bump.
+          invalidateSameTargetRequest();
+          try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+          const result = await rebuildAndRefetch("reasoning-effort-downgrade");
+          if ("failed" in result) return result.failed;
+          upstreamResponse = result;
+          continue recovery;
+        }
+      }
       break;
     }
     if (!upstreamResponse.ok) {
@@ -7932,6 +8442,7 @@ async function handleResponsesInner(
           return await activeAdapter.fetchResponse(builtContinuationRequest, {
             abortSignal: upstream.signal,
             timeoutMs: connectMs,
+              sendBudget: adapterSendBudget,
             stream: nextParsed.stream,
             executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               dispatchOverride: oauthDispatch(builtContinuationRequest, nextParsed),

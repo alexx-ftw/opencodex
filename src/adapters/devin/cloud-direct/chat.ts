@@ -46,22 +46,65 @@ import { resolveDevinApiBaseUrl } from '../../../oauth/devin/api-base.js';
  * we only trigger when the server has genuinely stopped responding.
  */
 const CLOUD_STREAM_IDLE_MS = 120_000;
-/** Time-to-first-byte timeout. */
-const CLOUD_STREAM_TTFB_MS = 60_000;
+/**
+ * Budget for the response HEADERS, which is not the same thing as a connect
+ * timeout. Cognition holds the headers until the model produces its first
+ * token, so on a high-effort reasoning model this bounds generation. A 60s
+ * value killed live swe-2 high turns at exactly 60000ms with no output while
+ * a sibling call on the same account was still alive at 76s, which is the
+ * defect this constant exists to record.
+ *
+ * It has to be at least as generous as the body idle budget above. The cost of
+ * the larger value is bounded and understood: a peer that goes silent at the
+ * TCP level without sending RST/FIN now hangs for this long instead of 60s. A
+ * peer that actually dies still rejects immediately. This timer is the only
+ * bound on that case once `timeout: 0` is set on the fetch, so it must not be
+ * removed. Override with OPENCODEX_DEVIN_TTFB_MS.
+ */
+const CLOUD_STREAM_HEADERS_DEFAULT_MS = 300_000;
+/** Upper bound for the override, so a stray value cannot wedge a turn forever. */
+const CLOUD_STREAM_HEADERS_MAX_MS = 1_800_000;
+function cloudStreamHeadersMs(): number {
+  const raw = process.env.OPENCODEX_DEVIN_TTFB_MS?.trim();
+  if (!raw) return CLOUD_STREAM_HEADERS_DEFAULT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return CLOUD_STREAM_HEADERS_DEFAULT_MS;
+  return Math.min(parsed, CLOUD_STREAM_HEADERS_MAX_MS);
+}
+/** Test seam for the headers budget; the resolver itself stays private. */
+export const cloudStreamHeadersMsForTests = cloudStreamHeadersMs;
 /** Maximum acceptable Connect-RPC frame length (16 MB). */
 const MAX_FRAME_LEN = 16 * 1024 * 1024;
 
 /**
- * Per-(apiKey, host) session/cascade ID cache. Cloud uses these for
- * server-side context caching across turns of the same conversation; if we
- * mint a fresh sessionId on every call (which we used to), every turn looks
- * like a brand-new session and the prompt-cache hit ratio is zero.
+ * PromptCacheOptions.type = EPHEMERAL. Marks the system prefix as a cache entry
+ * the server may reuse on the next turn of the same session.
+ */
+const PROMPT_CACHE_EPHEMERAL = 1;
+
+/**
+ * Per-identity session/cascade ID cache. Cloud uses these for server-side
+ * context caching across turns of the same conversation; if we mint a fresh
+ * sessionId on every call (which we used to), every turn looks like a
+ * brand-new session and the prompt-cache hit ratio is zero.
  * Single-process scope is enough: opencode lives in one runtime for a TUI
  * session, and CLI one-shots don't benefit from caching anyway.
  */
 interface SessionIds {
   sessionId: string;
   cascadeId: string;
+}
+
+/**
+ * Cache key for one Devin credential on one host.
+ *
+ * The credential itself used to be the Map key. Hashing it keeps the raw token
+ * out of any structure a heap dump or debugger would walk, and gives the other
+ * per-account caches a name they can share. 16 hex is 64 bits, which against a
+ * bounded single-process map is not a collision risk worth widening the key for.
+ */
+export function devinCacheIdentity(apiKey: string, host: string): string {
+  return crypto.createHash('sha256').update(`${host}\x1f${apiKey}`).digest('hex').slice(0, 16);
 }
 /**
  * Bounded the same way the adapter bounds its cascade-id map: a long-running
@@ -70,7 +113,7 @@ interface SessionIds {
 const SESSION_CACHE_MAX = 256;
 const sessionCache = new Map<string, SessionIds>();
 function getOrAllocateSessionIds(apiKey: string, host: string, cascadeIdOverride?: string): SessionIds {
-  const key = `${host}\x1f${apiKey}`;
+  const key = devinCacheIdentity(apiKey, host);
   let ids = sessionCache.get(key);
   if (!ids) {
     ids = {
@@ -90,9 +133,21 @@ function getOrAllocateSessionIds(apiKey: string, host: string, cascadeIdOverride
   return ids;
 }
 
-/** Drop the cached session IDs — call after logout so a new sign-in starts fresh. */
-export function clearSessionIds(): void {
-  sessionCache.clear();
+/**
+ * Drop the cached session for ONE identity, after that account signs out or is
+ * switched away from.
+ *
+ * This replaces a global clear(). The proxy serves several accounts from one
+ * process, so clearing every entry on a per-provider logout would strip the
+ * session and cascade of accounts that were mid-turn. That is why the global
+ * version was never safe to call, and why nothing ever called it.
+ *
+ * A turn already in flight is unaffected: it received its SessionIds object at
+ * request start and never re-reads the map, so it finishes on the session it
+ * began with and the next turn allocates fresh.
+ */
+export function invalidateSessionIdentity(identity: string): void {
+  sessionCache.delete(identity);
 }
 
 // ----------------------------------------------------------------------------
@@ -644,6 +699,7 @@ function buildGetChatMessageRequest(args: BuildArgs): Buffer {
   //   #7  request_type (varint enum)
   //   #8  completion_configuration
   //   #10 tools (repeated ChatToolDefinition)
+  //   #13 prompt_cache_options
   //   #16 cascade_id (string)
   //   #21 chat_model_uid (string)
   //   #22 prompt_id (string)
@@ -657,6 +713,13 @@ function buildGetChatMessageRequest(args: BuildArgs): Buffer {
     encodeVarintField(7, args.requestType ?? 5),
     encodeMessage(8, completion),
     ...toolParts,
+    // #13 prompt_cache_options: { type: EPHEMERAL }. Reusing a session id is only
+    // half of prompt caching — without this the server creates no cache entry and
+    // every turn re-reads the whole prefix, which is why the sessionId reuse above
+    // was not producing the hit ratio its comment claims. The native client sends
+    // it and records real savings; sending it unconditionally matches both the
+    // native client and CLIProxyAPIPlus, which places it outside its tools gate.
+    encodeMessage(13, encodeVarintField(1, PROMPT_CACHE_EPHEMERAL)),
     // #15 session model config: { id, turn, 4 }. Present on every verified
     // request.
     encodeMessage(15, Buffer.concat([
@@ -1115,12 +1178,24 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
   const framed = frameConnectStream(proto, false);
   const body = new Blob([new Uint8Array(framed)], { type: "application/connect+proto" });
 
-  // Compose caller signal with a TTFB timeout. If the cloud takes longer
-  // than CLOUD_STREAM_TTFB_MS to start the response, abort. Once any byte
-  // arrives we cancel the TTFB timer and start the per-chunk idle timer
-  // inside the read loop instead.
+  // Compose the caller signal with a deadline on the response HEADERS. The
+  // timer is cleared in the finally below, which runs when `await fetch`
+  // resolves — and fetch resolves on headers, not on the first body byte. An
+  // earlier comment here claimed "once any byte arrives", which was wrong and
+  // hid the defect: Cognition withholds headers until the first token, so this
+  // budget is a generation deadline. Body silence after headers is a separate
+  // budget, the per-chunk idle timer in the read loop below.
   const ttfbController = new AbortController();
-  const ttfbTimer = setTimeout(() => ttfbController.abort(new Error(`cloud-direct: time-to-first-byte timeout (${CLOUD_STREAM_TTFB_MS}ms)`)), CLOUD_STREAM_TTFB_MS);
+  const headersMs = cloudStreamHeadersMs();
+  // Abort with no reason and remember that we are the one who fired. Bun rejects
+  // the fetch with its own AbortError rather than handing back `signal.reason`,
+  // so attaching a typed error to abort() would be discarded; the catch below is
+  // what actually produces a classifiable failure.
+  let headersDeadlineFired = false;
+  const ttfbTimer = setTimeout(() => {
+    headersDeadlineFired = true;
+    ttfbController.abort();
+  }, headersMs);
   const ttfbSignal = ttfbController.signal;
   // Compose req.signal + ttfbSignal. AbortSignal.any was added in Node
   // 20.3 / Bun 1.0; our `engines` allows Node ≥18, so on Node 18-20.2 the
@@ -1148,7 +1223,28 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
       body,
       redirect: 'error',
       signal: initialSignal,
-    });
+      // Bun applies its own fetch idle timeout (~5 minutes) on top of ours.
+      // Two independent deadlines on the same hop means the shorter one wins
+      // silently and this function can no longer explain its own failure, so
+      // the deadline above is made the single authority. Same reason as
+      // src/server/responses/fetch-helpers.ts.
+      timeout: 0,
+    } as RequestInit);
+  } catch (err) {
+    if (headersDeadlineFired) {
+      // Ours, not the upstream failing. Raised as a typed error with an explicit
+      // status because devinErrorClassification reads CloudChatError.status and
+      // would otherwise return {} for a bare Error, leaving src/lib/errors.ts to
+      // guess from the message text. The message deliberately no longer says
+      // "timeout", so the status is the only thing carrying the classification.
+      throw new CloudChatError(
+        `cloud-direct: no response headers within ${headersMs}ms`,
+        undefined,
+        undefined,
+        504,
+      );
+    }
+    throw err;
   } finally {
     clearTimeout(ttfbTimer);
     // The composed signal only guards the headers hop; the body is cancelled
