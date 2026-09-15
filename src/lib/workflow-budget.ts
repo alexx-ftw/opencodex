@@ -29,10 +29,25 @@ import {
 export interface WorkflowBudgetPolicy {
   /** Children admitted concurrently under one root. */
   readonly maxConcurrentChildren: number;
-  /** Physical model sends charged to one root across its whole life. */
+  /** Physical model sends charged to one root INSIDE {@link WorkflowBudgetPolicy.windowMs}. */
   readonly maxPhysicalSends: number;
-  /** Distinct children one root may ever create. */
+  /** Distinct children one root may have inside the same window. */
   readonly maxDistinctChildren: number;
+  /**
+   * The interval both counts are measured over.
+   *
+   * These were lifetime totals, and a lifetime total is the wrong instrument. The cap was
+   * written against a fan-out that sends once per child seven hundred times, which is a RATE;
+   * a running total cannot tell that from an ordinary session spread over an afternoon and
+   * refuses both. Because the root id is the caller thread, for Codex that made the ceiling a
+   * session expiry: a session reaching it was refused for the rest of the process even after
+   * going idle for hours, and the only cure was restarting the proxy.
+   *
+   * Omitted means {@link WORKFLOW_DEFAULT_WINDOW_MS}. A count inside a window is never larger
+   * than the same count over a lifetime, so windowing can only ever admit more for identical
+   * traffic -- no install sees a refusal it would not have seen before.
+   */
+  readonly windowMs?: number;
   /**
    * Concurrency slots a fan-out may never take. An interactive turn arriving into a saturated
    * root still gets admitted; without this a worker burst starves the conversation it serves.
@@ -47,13 +62,89 @@ export interface WorkflowBudgetPolicy {
   readonly maxTrackedRoots: number;
 }
 
+/**
+ * Ten minutes. Long enough that the burst this ceiling was written against -- seven hundred
+ * sends in a minute -- is still refused several times over, and short enough that an ordinary
+ * session, which averages far less than a send every two seconds, never approaches it.
+ */
+export const WORKFLOW_DEFAULT_WINDOW_MS = 10 * 60_000;
+
 export const DEFAULT_WORKFLOW_BUDGET_POLICY: WorkflowBudgetPolicy = {
   maxConcurrentChildren: 8,
   maxPhysicalSends: 256,
   maxDistinctChildren: 64,
   interactiveReserve: 1,
   maxTrackedRoots: 512,
+  windowMs: WORKFLOW_DEFAULT_WINDOW_MS,
 };
+
+/** Fixed ring size. Ten minutes over twelve slots gives fifty-second granularity. */
+const WORKFLOW_WINDOW_SLOTS = 12;
+
+function workflowWindowMs(policy: WorkflowBudgetPolicy): number {
+  const declared = policy.windowMs;
+  return declared !== undefined && Number.isFinite(declared) && declared > 0
+    ? declared
+    : WORKFLOW_DEFAULT_WINDOW_MS;
+}
+
+/**
+ * Slot size for one root's own window.
+ *
+ * The geometry is read off the state rather than off whatever policy the current caller
+ * happens to hold. Two callers may legitimately pass different policies for the same root --
+ * the ceiling numbers are the caller's business -- but if they also disagreed about
+ * `windowMs`, the slot ids one of them wrote would be on a scale the other cannot read, and
+ * charging with a long window while reading with a short one makes every stored slot look
+ * ancient and the ceiling never fire at all.
+ */
+function windowSlotMs(windowMs: number): number {
+  return Math.max(1, Math.ceil(windowMs / WORKFLOW_WINDOW_SLOTS));
+}
+
+/**
+ * Add sends to the ring, resetting a slot whose turn has come round again.
+ *
+ * A ring rather than a list of timestamps because the storage has to be bounded: a root that
+ * sends forever would otherwise grow forever, and this ledger exists to bound a fan-out.
+ */
+function recordWindowedSends(state: WorkflowState, now: number, sends: number): void {
+  const slotMs = windowSlotMs(state.windowMs);
+  const slot = Math.floor(now / slotMs);
+  const index = ((slot % WORKFLOW_WINDOW_SLOTS) + WORKFLOW_WINDOW_SLOTS) % WORKFLOW_WINDOW_SLOTS;
+  if (state.sendSlotAt[index] !== slot) {
+    state.sendSlotAt[index] = slot;
+    state.sendSlotCount[index] = 0;
+  }
+  state.sendSlotCount[index] = (state.sendSlotCount[index] ?? 0) + sends;
+}
+
+/** Sends inside the window. A slot older than the window contributes nothing. */
+function windowedSends(state: WorkflowState, now: number): number {
+  const slotMs = windowSlotMs(state.windowMs);
+  const oldest = Math.floor(now / slotMs) - (WORKFLOW_WINDOW_SLOTS - 1);
+  let total = 0;
+  for (let index = 0; index < WORKFLOW_WINDOW_SLOTS; index += 1) {
+    if ((state.sendSlotAt[index] ?? Number.NEGATIVE_INFINITY) >= oldest) {
+      total += state.sendSlotCount[index] ?? 0;
+    }
+  }
+  return total;
+}
+
+/**
+ * Forget children last seen before the window opened, and report how many remain.
+ *
+ * Pruning on read keeps the map bounded without a timer: every admission pays for the children
+ * it can still see, and a root that goes quiet is cleaned up the next time it speaks.
+ */
+function windowedChildren(state: WorkflowState, now: number): number {
+  const cutoff = now - state.windowMs;
+  for (const [childId, lastSeenMs] of state.children) {
+    if (lastSeenMs <= cutoff) state.children.delete(childId);
+  }
+  return state.children.size;
+}
 
 export type WorkflowDenial =
   | "workflow-concurrency-exhausted"
@@ -70,6 +161,146 @@ export type WorkflowDenial =
   | "workflow-send-replayed"
   /** The reservation could not be made durable, and a configured ceiling requires it. */
   | "workflow-spend-undurable";
+
+/**
+ * The sentence an operator reads, plus the machine-readable name of the ceiling that fired.
+ *
+ * All four count denials used to share one sentence about a "concurrent-work limit", which was
+ * accurate for exactly one of them. Worse, the wire cannot carry the distinction on its own:
+ * `classifyError` rewrites every 429 to `rate_limit_error` / `rate_limit_exceeded`, so the body
+ * of a refusal this proxy made is shaped exactly like a provider rate limit. Each sentence
+ * therefore says which ceiling fired AND that no provider was contacted, because that is the
+ * first thing an operator needs and the only place left to put it.
+ */
+export function workflowDenialSummary(reason: WorkflowDenial): { code: string; message: string } {
+  switch (reason) {
+    case "workflow-sends-exhausted":
+      return {
+        code: "workflow_sends_exhausted",
+        message: "This proxy refused the request locally: the task reached its send ceiling for"
+          + " the current window, so no provider was contacted. The window rolls forward on its"
+          + " own; work already in flight settles as it finishes.",
+      };
+    case "workflow-children-exhausted":
+      return {
+        code: "workflow_children_exhausted",
+        message: "This proxy refused the request locally: the task reached its ceiling on"
+          + " distinct child threads for the current window, so no provider was contacted."
+          + " A child that goes quiet ages out of the count.",
+      };
+    case "workflow-concurrency-exhausted":
+      return {
+        code: "workflow_concurrency_exhausted",
+        message: "This proxy refused the request locally: the task has no free concurrency slot,"
+          + " so no provider was contacted. Slots are released as the turns holding them finish.",
+      };
+    case "workflow-spend-exhausted":
+      return {
+        code: "workflow_spend_exhausted",
+        message: "This proxy refused the request locally: the task reached a configured token"
+          + " ceiling, so no provider was contacted.",
+      };
+    case "workflow-tracking-exhausted":
+      return {
+        code: "workflow_tracking_exhausted",
+        message: "This proxy refused the request locally: it is already tracking as many tasks as"
+          + " it may, and every one of them is busy or over its own ceiling, so no provider was"
+          + " contacted.",
+      };
+    case "workflow-send-replayed":
+      return {
+        code: "workflow_send_replayed",
+        message: "This proxy refused the request locally: this send was already reserved once, and"
+          + " a repeat buys no second dispatch.",
+      };
+    case "workflow-spend-undurable":
+      return {
+        code: "workflow_spend_undurable",
+        message: "This proxy refused the request locally: the token reservation could not be made"
+          + " durable and a configured ceiling requires it, so no provider was contacted.",
+      };
+  }
+}
+
+/**
+ * Response header naming the ceiling that refused, on a refusal this proxy made itself.
+ *
+ * It exists because the body cannot carry it: `classifyError` rewrites every 429 to
+ * `rate_limit_error` / `rate_limit_exceeded`, so a local refusal and a provider rate limit are
+ * byte-identical in shape. Changing that classification would change how every client retries,
+ * so the name goes beside the body instead. No upstream sets this header, which is precisely
+ * what makes its presence conclusive.
+ */
+export const WORKFLOW_LOCAL_REFUSAL_HEADER = "x-opencodex-local-refusal";
+
+export type WorkflowBudgetEventKind = "refused" | "cleared";
+
+export interface WorkflowBudgetEvent {
+  readonly at: number;
+  readonly kind: WorkflowBudgetEventKind;
+  readonly rootId: string;
+  /** The ceiling that fired. Present for `refused`, absent for `cleared`. */
+  readonly reason?: WorkflowDenial;
+  /** Windowed sends at the moment of the event. */
+  readonly sends: number;
+  /** Windowed distinct children at the moment of the event. */
+  readonly children: number;
+}
+
+/**
+ * How many events are kept. Small on purpose: this is an operator's recent-history view, not an
+ * audit log, and it lives in the same process memory the ceilings do.
+ */
+export const WORKFLOW_EVENT_CAPACITY = 64;
+
+const budgetEvents: WorkflowBudgetEvent[] = [];
+
+/**
+ * Record a local budget decision.
+ *
+ * This exists because the refusal has nowhere else to go. The HTTP admission check runs before
+ * the body is parsed, so there is no model, no provider and no request-log context to attach to;
+ * writing a usage row there would mean inventing both. Every entry here is by construction a
+ * decision this proxy made without contacting anyone, which is a stronger statement than a flag
+ * on a row shared with upstream results.
+ */
+function recordBudgetEvent(event: WorkflowBudgetEvent): void {
+  budgetEvents.push(event);
+  while (budgetEvents.length > WORKFLOW_EVENT_CAPACITY) budgetEvents.shift();
+}
+
+/** Newest first. `limit` is clamped to what is actually kept. */
+export function listWorkflowBudgetEvents(limit: number = WORKFLOW_EVENT_CAPACITY): WorkflowBudgetEvent[] {
+  const wanted = Number.isFinite(limit) && limit > 0
+    ? Math.min(Math.floor(limit), WORKFLOW_EVENT_CAPACITY)
+    : 0;
+  if (wanted === 0) return [];
+  return budgetEvents.slice(-wanted).reverse();
+}
+
+/**
+ * Record a refusal decided outside `admitWorkflowTurn`.
+ *
+ * The pre-dispatch ceiling check in the responses path is a second refusal, taken after
+ * admission already succeeded, so nothing in this module sees it. Without this it was the one
+ * refusal an operator could hit that left no event behind.
+ */
+export function recordWorkflowRefusalEvent(
+  rootId: string | undefined,
+  reason: WorkflowDenial,
+  now: number = Date.now(),
+): void {
+  if (!rootId) return;
+  const state = roots.get(rootId);
+  recordBudgetEvent({
+    at: now,
+    kind: "refused",
+    rootId,
+    reason,
+    sends: state ? windowedSends(state, now) : 0,
+    children: state ? windowedChildren(state, now) : 0,
+  });
+}
 
 export type WorkflowLane = "interactive" | "worker";
 
@@ -113,9 +344,28 @@ export interface WorkflowSpendRequest {
 
 interface WorkflowState {
   active: number;
+  /** Lifetime total, kept for diagnostics only. The ceiling reads the window instead. */
   sends: number;
-  children: Set<string>;
+  /** Ring of per-slot send counts; sendSlotAt[i] names the slot that bucket holds. */
+  sendSlotCount: number[];
+  sendSlotAt: number[];
+  /** Child id to the last time it was admitted, so a child that stops ages out of the count. */
+  children: Map<string, number>;
   lastSeenMs: number;
+  /** Window this root's ring and child map are measured over, fixed when the root appeared. */
+  windowMs: number;
+}
+
+function newWorkflowState(now: number, policy: WorkflowBudgetPolicy): WorkflowState {
+  return {
+    active: 0,
+    sends: 0,
+    sendSlotCount: new Array<number>(WORKFLOW_WINDOW_SLOTS).fill(0),
+    sendSlotAt: new Array<number>(WORKFLOW_WINDOW_SLOTS).fill(Number.NEGATIVE_INFINITY),
+    children: new Map<string, number>(),
+    lastSeenMs: now,
+    windowMs: workflowWindowMs(policy),
+  };
 }
 
 const roots = new Map<string, WorkflowState>();
@@ -127,7 +377,11 @@ const roots = new Map<string, WorkflowState>();
  * the new root regardless, so `maxTrackedRoots` bounded nothing whenever every candidate
  * was active or exhausted -- which is precisely the fan-out this file exists to bound.
  */
-function evictOneRoot(policy: WorkflowBudgetPolicy, spendLedger?: SpendReservationLedger): boolean {
+function evictOneRoot(
+  policy: WorkflowBudgetPolicy,
+  spendLedger?: SpendReservationLedger,
+  now: number = Date.now(),
+): boolean {
   let oldestKey: string | undefined;
   let oldestAt = Number.POSITIVE_INFINITY;
   for (const [key, state] of roots) {
@@ -136,7 +390,7 @@ function evictOneRoot(policy: WorkflowBudgetPolicy, spendLedger?: SpendReservati
     // EXHAUSTED-but-idle root -- count-exhausted or spend-exhausted -- because recreating it
     // fresh under the same id resets the very ceiling that already fired.
     if (state.active > 0) continue;
-    if (state.sends >= policy.maxPhysicalSends) continue;
+    if (windowedSends(state, now) >= policy.maxPhysicalSends) continue;
     if (spendLedger?.exhausted("root", key) === true) continue;
     if (state.lastSeenMs < oldestAt) { oldestAt = state.lastSeenMs; oldestKey = key; }
   }
@@ -173,30 +427,46 @@ export function admitWorkflowTurn(
   // still see spend-exhausted entries. With neither, no token tracking is in play.
   const ledger = spendLedger ?? (spend ? sharedSpendLedger() : undefined);
   let state = roots.get(rootId);
+  // Every refusal below goes on the record through this one seam. Recording at each return
+  // site instead of at the HTTP caller is what makes the record complete: the spend denials
+  // are decided inside the ledger branch and never surface as a distinct reason to the caller
+  // that formats the response.
+  const refuse = (reason: WorkflowDenial, spendScope?: SpendScope): WorkflowDecision => {
+    const current = roots.get(rootId);
+    recordBudgetEvent({
+      at: now,
+      kind: "refused",
+      rootId,
+      reason,
+      sends: current ? windowedSends(current, now) : 0,
+      children: current ? windowedChildren(current, now) : 0,
+    });
+    return { admitted: false, reason, rootId, ...(spendScope ? { spendScope } : {}) };
+  };
   if (!state) {
-    if (roots.size >= policy.maxTrackedRoots && !evictOneRoot(policy, ledger)) {
+    if (roots.size >= policy.maxTrackedRoots && !evictOneRoot(policy, ledger, now)) {
       // Nothing may be forgotten, so the new root is refused instead of admitted over the
       // bound. The alternative -- evicting an exhausted root -- resets the ceiling that
       // already fired, and a caller minting fresh ids would get unlimited budget from it.
-      return { admitted: false, reason: "workflow-tracking-exhausted", rootId };
+      return refuse("workflow-tracking-exhausted");
     }
-    state = { active: 0, sends: 0, children: new Set(), lastSeenMs: now };
+    state = newWorkflowState(now, policy);
     roots.set(rootId, state);
   }
   state.lastSeenMs = now;
 
-  if (state.sends >= policy.maxPhysicalSends) {
-    return { admitted: false, reason: "workflow-sends-exhausted", rootId };
+  if (windowedSends(state, now) >= policy.maxPhysicalSends) {
+    return refuse("workflow-sends-exhausted");
   }
   if (childId !== undefined && !state.children.has(childId)
-    && state.children.size >= policy.maxDistinctChildren) {
-    return { admitted: false, reason: "workflow-children-exhausted", rootId };
+    && windowedChildren(state, now) >= policy.maxDistinctChildren) {
+    return refuse("workflow-children-exhausted");
   }
   const ceiling = lane === "worker"
     ? Math.max(0, policy.maxConcurrentChildren - policy.interactiveReserve)
     : policy.maxConcurrentChildren;
   if (state.active >= ceiling) {
-    return { admitted: false, reason: "workflow-concurrency-exhausted", rootId };
+    return refuse("workflow-concurrency-exhausted");
   }
 
   if (spend && ledger) {
@@ -219,17 +489,15 @@ export function admitWorkflowTurn(
           : denial.reason === "tracking-capacity-exhausted"
             ? "workflow-tracking-exhausted"
             : "workflow-spend-exhausted";
-      return {
-        admitted: false,
+      return refuse(
         reason,
-        rootId,
-        spendScope: denial.reason === "spend-limit-exceeded" ? denial.scope : undefined,
-      };
+        denial.reason === "spend-limit-exceeded" ? denial.scope : undefined,
+      );
     }
   }
 
   state.active += 1;
-  if (childId !== undefined) state.children.add(childId);
+  if (childId !== undefined) state.children.set(childId, now);
   let released = false;
   return {
     admitted: true,
@@ -244,6 +512,8 @@ export function admitWorkflowTurn(
         const current = roots.get(rootId);
         if (current) {
           current.active = Math.max(0, current.active - 1);
+          // Eviction ordering only; no ceiling reads lastSeenMs, so the wall clock is the
+          // right source here and a caller does not need to inject one.
           current.lastSeenMs = Date.now();
         }
         // Which of the two applies depends on whether the send ever left this process.
@@ -263,12 +533,20 @@ export function admitWorkflowTurn(
  * Charge physical sends to a root. Called from the send budget's own accounting so a retry
  * inside one request counts toward the workflow total, not only the request total.
  */
-export function chargeWorkflowSends(rootId: string | undefined, sends: number): void {
+export function chargeWorkflowSends(
+  rootId: string | undefined,
+  sends: number,
+  now: number = Date.now(),
+): void {
   if (!rootId || sends <= 0) return;
   const state = roots.get(rootId);
   if (!state) return;
   state.sends += sends;
-  state.lastSeenMs = Date.now();
+  // Geometry comes off the root itself, so no caller can charge on one scale and read on
+  // another. This function does not take a policy at all any more: it has no ceiling to
+  // compare, and the only thing a policy could have supplied here was that scale.
+  recordWindowedSends(state, now, sends);
+  state.lastSeenMs = now;
 }
 
 /**
@@ -315,21 +593,103 @@ export function abandonWorkflowSpend(sendId: string, spendLedger?: SpendReservat
 export function workflowSendCeilingReached(
   rootId: string | undefined,
   policy: WorkflowBudgetPolicy = DEFAULT_WORKFLOW_BUDGET_POLICY,
+  now: number = Date.now(),
 ): boolean {
   if (!rootId) return false;
   const state = roots.get(rootId);
-  return state !== undefined && state.sends >= policy.maxPhysicalSends;
+  return state !== undefined && windowedSends(state, now) >= policy.maxPhysicalSends;
 }
 
-export function workflowBudgetSnapshot(rootId: string): {
+export interface WorkflowBudgetSnapshot {
+  active: number;
+  /** Sends inside the window. This is the number the ceiling compares. */
+  sends: number;
+  /** Children inside the window, which is likewise what the ceiling compares. */
+  children: number;
+  /** Everything the root has ever sent, for diagnostics; no ceiling reads it. */
+  lifetimeSends: number;
+  windowMs: number;
+  maxPhysicalSends: number;
+  maxDistinctChildren: number;
+}
 
-  active: number; sends: number; children: number;
-} | undefined {
+export function workflowBudgetSnapshot(
+  rootId: string,
+  policy: WorkflowBudgetPolicy = DEFAULT_WORKFLOW_BUDGET_POLICY,
+  now: number = Date.now(),
+): WorkflowBudgetSnapshot | undefined {
   const state = roots.get(rootId);
-  return state ? { active: state.active, sends: state.sends, children: state.children.size } : undefined;
+  if (!state) return undefined;
+  return {
+    active: state.active,
+    sends: windowedSends(state, now),
+    children: windowedChildren(state, now),
+    lifetimeSends: state.sends,
+    windowMs: state.windowMs,
+    maxPhysicalSends: policy.maxPhysicalSends,
+    maxDistinctChildren: policy.maxDistinctChildren,
+  };
+}
+
+/**
+ * Roots this process is currently tracking, most recently active first.
+ *
+ * Bounded by `limit` because `maxTrackedRoots` is 512 and an operator asking what is going on
+ * wants the busy end of that, not a dump.
+ */
+export function listTrackedWorkflowRoots(
+  limit = 64,
+  policy: WorkflowBudgetPolicy = DEFAULT_WORKFLOW_BUDGET_POLICY,
+  now: number = Date.now(),
+): Array<{ rootId: string } & WorkflowBudgetSnapshot> {
+  const wanted = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0;
+  if (wanted === 0) return [];
+  return [...roots.entries()]
+    .sort((left, right) => right[1].lastSeenMs - left[1].lastSeenMs)
+    .slice(0, wanted)
+    .flatMap(([rootId]) => {
+      const snapshot = workflowBudgetSnapshot(rootId, policy, now);
+      return snapshot ? [{ rootId, ...snapshot }] : [];
+    });
+}
+
+/**
+ * Clear ONE root's windowed count ceilings, and report what they were.
+ *
+ * Three things are deliberately left alone. `active` belongs to turns still in flight, and
+ * zeroing it would let their releases drive the count negative and hand out concurrency slots
+ * that are already taken. The spend ledger is a token budget an operator did not ask to
+ * forgive, and a count ceiling is not a licence to reset it. `sends` -- the lifetime total --
+ * survives too, so the record of what this root actually did cannot be laundered by clearing
+ * it; only the ceilings move.
+ *
+ * Returns the snapshot taken immediately before the clear, so the caller can put on the record
+ * what it forgave, or `undefined` when the root is not tracked at all.
+ */
+export function clearWorkflowBudgetForRoot(
+  rootId: string,
+  policy: WorkflowBudgetPolicy = DEFAULT_WORKFLOW_BUDGET_POLICY,
+  now: number = Date.now(),
+): WorkflowBudgetSnapshot | undefined {
+  const state = roots.get(rootId);
+  if (!state) return undefined;
+  const before = workflowBudgetSnapshot(rootId, policy, now);
+  state.sendSlotCount.fill(0);
+  state.sendSlotAt.fill(Number.NEGATIVE_INFINITY);
+  state.children.clear();
+  state.lastSeenMs = now;
+  recordBudgetEvent({
+    at: now,
+    kind: "cleared",
+    rootId,
+    sends: before?.sends ?? 0,
+    children: before?.children ?? 0,
+  });
+  return before;
 }
 
 /** Test seam. Production never clears a live ledger: that would reset a spent budget. */
 export function resetWorkflowBudgetsForTest(): void {
   roots.clear();
+  budgetEvents.length = 0;
 }
