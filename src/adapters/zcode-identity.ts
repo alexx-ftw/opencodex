@@ -54,16 +54,12 @@ function clientTimezone(): string {
   }
 }
 
-/** True for plan-metered GLM destinations (coding-plan and plan-gateway send URLs). */
+/** True for the plan-gateway send URLs this adapter targets. */
 export function isZcodePlanMeteredEndpoint(sendUrl: string | undefined): boolean {
   if (!sendUrl) return false;
   const url = sendUrl.replace(/\/+$/, "").toLowerCase();
-  if (url.startsWith("https://zcode.z.ai/api/v1/zcode-plan")) return true;
-  return url === "https://api.z.ai/api/coding/paas/v4/chat/completions"
-    || url === "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
-    || url === "https://api.z.ai/api/v1/responses"
-    || url === "https://open.bigmodel.cn/api/v1/responses"
-    || url === "https://open.bigmodel.cn/api/v1";
+  return url === "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
+    || url === "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages?beta=true";
 }
 
 /** Companion headers the official client sends on every LLM completion. */
