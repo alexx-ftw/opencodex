@@ -16,33 +16,25 @@ import {
 } from "../../src/adapters/zcode-identity";
 
 describe("zcode identity attribution eligibility", () => {
-  test("plan-metered GLM send URLs qualify (resolved chat/responses paths + plan gateway)", () => {
-    expect(isZcodePlanMeteredEndpoint("https://api.z.ai/api/coding/paas/v4/chat/completions")).toBe(true);
-    expect(isZcodePlanMeteredEndpoint("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions")).toBe(true);
-    expect(isZcodePlanMeteredEndpoint("https://open.bigmodel.cn/api/v1")).toBe(true);
+  test("the plan gateway messages endpoint qualifies", () => {
     expect(isZcodePlanMeteredEndpoint("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")).toBe(true);
-    expect(isZcodePlanMeteredEndpoint("https://api.z.ai/api/v1/responses")).toBe(true);
   });
 
-  test("pay-as-you-go and unrelated send URLs do not qualify", () => {
+  test("other upstreams (coding-plan, pay-as-you-go, unrelated) do not qualify", () => {
+    expect(isZcodePlanMeteredEndpoint("https://api.z.ai/api/coding/paas/v4/chat/completions")).toBe(false);
+    expect(isZcodePlanMeteredEndpoint("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions")).toBe(false);
     expect(isZcodePlanMeteredEndpoint("https://open.bigmodel.cn/api/paas/v4/chat/completions")).toBe(false);
-    expect(isZcodePlanMeteredEndpoint("https://api.z.ai/api/paas/v4/chat/completions")).toBe(false);
     expect(isZcodePlanMeteredEndpoint("https://api.openai.com/v1/responses")).toBe(false);
     expect(isZcodePlanMeteredEndpoint(undefined)).toBe(false);
   });
 
-  test("coding-plan scope adds the x-query-id/x-session-id pair; start-plan scope omits it", () => {
-    const coding = buildZcodeTraceHeaders("coding-plan");
+  test("start-plan trace headers omit the coding-plan attribution pair", () => {
     const start = buildZcodeTraceHeaders("start-plan");
-    expect(coding["x-query-id"]).toBeDefined();
-    expect(coding["x-session-id"]).toBeDefined();
     expect(start["x-query-id"]).toBeUndefined();
     expect(start["x-session-id"]).toBeUndefined();
-    for (const t of [coding, start]) {
-      expect(t["x-zcode-session-type"]).toBe("main");
-      expect(t["x-request-id"]).toBeDefined();
-      expect(t["x-zcode-trace-id"]).toBeDefined();
-    }
+    expect(start["x-zcode-session-type"]).toBe("main");
+    expect(start["x-request-id"]).toBeDefined();
+    expect(start["x-zcode-trace-id"]).toBeDefined();
   });
 
   test("identity headers carry the ZCode client attribution", () => {

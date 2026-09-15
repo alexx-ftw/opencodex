@@ -2791,7 +2791,8 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     adapter: "zcode-start-plan",
     authKind: "oauth",
     oauthId: "zcode-start-plan",
-    featured: true,
+    // Not featured on first landing: the gateway surface (WAF captcha + client identity)
+    // is still settling; promote to featured once stabilized.
     dashboardUrl: "https://zcode.z.ai",
     defaultModel: "GLM-5.3",
     note: "Z.ai Start Plan quota from the ZCode gateway (OAuth login)",

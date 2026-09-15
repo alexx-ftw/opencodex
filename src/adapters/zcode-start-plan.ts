@@ -24,15 +24,16 @@
  * surfaced as upstream_error (it decays on its own; retrying immediately deepens it).
  */
 import { createAnthropicAdapter } from "./anthropic";
+import { arch, platform } from "node:os";
 import type { AdapterFetchContext, AdapterRequest, IncomingMeta, ProviderAdapter } from "./base";
 import type { OcxParsedRequest, OcxProviderConfig } from "../types";
 import { solveTraceless } from "./zcode-start-plan/captcha-host";
 import { transformStartPlanBody, userIdFromJwt } from "./zcode-start-plan/body-transform";
 import { buildZcodeIdentityHeaders, buildZcodeTraceHeaders } from "./zcode-identity";
 
-/** Public config endpoint the desktop client reads its captcha scene from. */
-const CAPTCHA_CONFIG_URL =
-  "https://zcode.z.ai/api/v1/client/configs?app_version=3.11.2&platform=linux-x64";
+/** Public config endpoint the desktop client reads its captcha scene from.
+ *  The platform segment mirrors the desktop build convention (`<platform>-<arch>`). */
+const CAPTCHA_CONFIG_URL = `https://zcode.z.ai/api/v1/client/configs?app_version=3.11.2&platform=${encodeURIComponent(`${platform()}-${arch()}`)}`;
 const CAPTCHA_PARAM_HEADER = "x-aliyun-captcha-verify-param";
 const CAPTCHA_REGION_HEADER = "x-aliyun-captcha-verify-region";
 /** Magic strings of the in-body challenge, both JSON spacing styles. */
@@ -44,7 +45,7 @@ export const buildLlmIdentityHeaders = () => buildZcodeIdentityHeaders({ userAge
 export const buildTraceHeaders = () => buildZcodeTraceHeaders("start-plan");
 
 /** True when the provider targets the ZCode plan gateway. */
-export function isZcodeStartPlanEndpoint(baseUrl: string | undefined): boolean {
+function isZcodeStartPlanEndpoint(baseUrl: string | undefined): boolean {
   return !!baseUrl && /https:\/\/(zcode\.z\.ai|zcode\.chatglm\.site)\/api\/v1\/zcode-plan/.test(baseUrl);
 }
 
