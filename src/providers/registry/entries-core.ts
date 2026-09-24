@@ -780,8 +780,15 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // published by its client config. Live discovery would 404 every startup.
     liveModels: false,
     // GLM-5.3-Flash accepts image input on this gateway (per the client config the
-    // desktop client loads); GLM-5.3 and GLM-5.2 stay text-only.
-    modelInputModalities: { "GLM-5.3-Flash": ["text", "image"] },
+    // desktop client loads). The text-only entries matter: without explicit modality
+    // evidence the client blocks image attachments instead of routing them through the
+    // vision sidecar, and GLM-5-Turbo's sidecar eligibility on this gateway is unknown.
+    modelInputModalities: {
+      "GLM-5.3": ["text"],
+      "GLM-5.3-Flash": ["text", "image"],
+      "GLM-5.2": ["text"],
+      "GLM-5-Turbo": ["text"],
+    },
   },
   {
     id: "umans",

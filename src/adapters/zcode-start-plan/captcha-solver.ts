@@ -2236,6 +2236,7 @@ async function solveTraceless(opts) {
         });
       } catch (err) {
         clearTimeout(timer);
+        clearInterval(stallTimer);
         reject(err);
       }
     });

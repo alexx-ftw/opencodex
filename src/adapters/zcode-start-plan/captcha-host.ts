@@ -99,6 +99,10 @@ export function solveTraceless(opts: {
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(id);
+      // A hung guest solve poisons the shared worker chain: every later solve would
+      // queue behind it and time out too. Discard the worker so the next solve
+      // respawns a fresh one instead of staying permanently broken.
+      try { w.terminate(); } catch { /* already gone */ }
       reject(new Error("captcha worker solve timed out"));
     }, opts.timeoutMs + 15_000);
     if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();

@@ -578,10 +578,11 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   const [accountLabels, setAccountLabels] = useState<Map<string, string>>(new Map());
   useEffect(() => {
     const controller = new AbortController();
+    let cancelled = false;
     fetch(`${apiBase}/api/account-labels`, { signal: controller.signal })
       .then(res => (res.ok ? res.json() as Promise<{ labels?: Array<{ label?: unknown; email?: unknown; plan?: unknown }> }> : null))
       .then(body => {
-        if (!body?.labels) return;
+        if (cancelled || !body?.labels) return;
         const map = new Map<string, string>();
         for (const row of body.labels) {
           if (typeof row.label !== "string" || !row.label) continue;
@@ -590,11 +591,15 @@ export default function Logs({ apiBase }: { apiBase: string }) {
           if (typeof row.plan === "string" && row.plan) parts.push(row.plan);
           if (parts.length > 0) map.set(row.label, parts.join(" · "));
         }
-        setAccountLabels(map);
+        if (!cancelled) setAccountLabels(map);
       })
       .catch(() => {
         // Older proxy without the endpoint: fall back to the raw opaque labels.
       });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [apiBase]);
   // The hash is the source of truth for the active tab (#logs vs #logs/debug),
   // so refresh/bookmark/back-forward keep the tab choice.
