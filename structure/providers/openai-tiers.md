@@ -204,12 +204,21 @@ existing minimal non-stored warmup through that exact account once the timestamp
 field-patches the completed timestamp. The next observed reset boundary is also retained in
 `nextFiveHourResetAt` / `nextWeeklyResetAt` until completed; later idle-window metadata cannot
 postpone it. Successful warmups publish quota headers under the captured credential/identity fence.
-For opted-in accounts only, stale metadata is refreshed at most once per five minutes through
-the existing WHAM recovery path, independently of dashboard traffic or reset notifications.
+Known deadlines suppress activation-owned WHAM queries regardless of snapshot age, including
+when only persisted deadlines survive a restart. Missing enabled-window deadlines use the existing
+WHAM recovery path after the five-minute freshness guard; unresolved discovery backs off from
+five minutes to an hour (5, 10, 20, 40, 60 minutes). Passive headers can satisfy discovery without
+a query. Completed warmups seed the next deadlines from response headers; missing next-window
+headers use the same discovery path. Retry delays are process-local; deadlines remain durable.
+Dashboard queries and reset-notification polling are separate owners and retain their behavior.
 Inference 401s quarantine the rejected credential; failures log an opaque label and safe reason.
 Paused or reauthentication-required
-accounts are skipped, simultaneous 5-hour/weekly resets share one warmup, transient failures retry
-after five minutes, and account deletion removes its setting and completion markers.
+accounts are skipped, simultaneous 5-hour/weekly resets share one warmup, transient activation failures
+back off from five minutes to an hour, and account deletion removes settings and retry/completion state.
+Retry records name the credential generation they were observed under (main quota generation, pool
+record generation). A record from a replaced or reauthenticated credential is dropped when read, and a
+failure that raced a replacement is not recorded. A local `NativeMainBusyError` admission refusal sends
+nothing upstream, so it retries after one minute and keeps the upstream backoff unchanged.
 Main-account hard-lock also gates these billable warmups. A policy/identity skip changes neither
 completion markers nor retry delay; quota reads remain available. Main refresh completes before
 shared credential ownership, then prepared credentials and restrictions are rechecked. Lifecycle
@@ -289,8 +298,12 @@ Regression coverage lives in `tests/codex-integration/codex-quota-parser-parity.
 `tests/usage/quota-reset-observation.test.ts`, and `tests/usage/quota-reset-seen-store.test.ts`.
 
 `codexMainAccountHardLock` is a local admission policy that is **on by default** since #5694, at
-`MAIN_ACCOUNT_HARD_LOCK_PERCENT` = 98% of the 5h/short window when present, otherwise the weekly
-window (monthly for monthly-only accounts). It does not take the maximum across those windows.
+`MAIN_ACCOUNT_HARD_LOCK_PERCENT` = 98%. The 5h/short window and the weekly window each govern on
+their own: either one at 98% blocks, and an unknown or invalid reading in one never hides a block
+in the other (unknown still admits). Monthly governs only a monthly-only account. A block holds
+until every blocking window reads lower, so its reported `resetAt` is the latest blocking reset,
+omitted when any blocking window has none. In the policy snapshot a reset-only weekly observation
+keeps a blocking weekly tuple, mirroring the short-window rule; monthly-primary evidence still replaces it.
 It blocks newly admitted identity-matched main-account requests. Pool alternatives remain eligible;
 explicit main selection and stored Direct substitution do not override it. It neither pauses the
 account nor clears upstream cooldown/reauth state, and management quota refresh remains available.

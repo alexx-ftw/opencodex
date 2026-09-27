@@ -60,6 +60,9 @@ import {
   runNpmCachePreflight,
   type NpmCachePreflightReason,
 } from "./npm-cache-preflight.mjs";
+import { guiUpdateWorkerCommand } from "./worker-launch";
+import { withoutSiblingMarker } from "../codex/sibling-start";
+import type { WorkerLaunchContext } from "./worker-launch";
 
 const RELEASE_NOTES_URL = "https://github.com/lidge-jun/opencodex/releases/latest";
 const UPDATE_JOB_FILENAME = "update-job.json";
@@ -566,6 +569,7 @@ export function spawnGuiUpdateWorker(
   jobId: string,
   channel: Channel,
   restart: boolean,
+  context: WorkerLaunchContext = {},
 ): UpdateWorkerProcess {
   const args = selfLaunchArgv([
     "__gui-update-worker",
@@ -574,7 +578,8 @@ export function spawnGuiUpdateWorker(
     restart ? "restart" : "no-restart",
   ]);
   if (process.platform !== "win32") {
-    return spawn(process.execPath, args, {
+    const launch = guiUpdateWorkerCommand(process.execPath, args, context);
+    return spawn(launch.command, launch.argv, {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
@@ -932,7 +937,8 @@ function spawnDetachedStart(
   launcher = packageLauncherPath(),
 ): ChildProcess {
   const cmd = restartCommand(false, installer, launcher, port);
-  const env = { ...process.env };
+  // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+  const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);
   delete env.OCX_SERVICE;
   updateJob(job, {}, `$ ${cmd.display}`);
   let stdio: "ignore" | [ "ignore", number, number ] = "ignore";

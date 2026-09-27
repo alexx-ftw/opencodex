@@ -23,7 +23,7 @@ ocx claude
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 自动上下文压缩阈值（默认 `829800`）；仅在启用自动上下文时注入 |
 | `ANTHROPIC_MODEL` | `claudeCode.model`（可选） |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claudeCode.tierModels.haiku ?? claudeCode.smallFastModel`（可选，也包括旧版 `ANTHROPIC_SMALL_FAST_MODEL`） |
-| `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*`（可选） |
+| `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*`（以订阅方式启动且未设置时为原生 `claude-opus-5-5[1m]` / `claude-sonnet-5[1m]` / `claude-fable-5-1[1m]`） |
 | `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` | 启用 `alwaysEnableEffort` 时设为 `1`（条件注入） |
 | `ENABLE_TOOL_SEARCH` | 设置了 `claudeCode.toolSearch` 时注入（条件注入，默认关闭） |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | 设置 `maxContextTokens` 时使用的旧版上下文覆盖项（条件注入） |
@@ -110,26 +110,31 @@ Anthropic 可能认为这违反其条款并暂停你的账户。默认模式是�
 只有接受这一风险时才选择第一方模式。
 :::
 
-Desktop 保持登录 claude.ai，聊天、连接器和远程控制仍可使用。OpenCodex 只在
-`~/.claude/settings.json`（支持 `CLAUDE_CONFIG_DIR`）的 `env` 中写入 `HTTPS_PROXY`
-和 `NODE_EXTRA_CA_CERTS`。Code 标签页启动的 Claude Code、子代理及独立的 `claude` CLI
-经过本地代理；其他 `api.anthropic.com` 路径会转发给 Anthropic。CA 不会安装到操作系统
-信任存储中，只有读取 `NODE_EXTRA_CA_CERTS` 的 Node 进程会信任它。
+Desktop 第一方模式通过 OpenCodex 处理 Code 标签页及其子代理。独立的 Claude Code CLI 有单独开关。两者读取同一份 `settings.json` 代理与 CA 设置：只开启其中一个时，另一个仍会经过本地代理，TLS 在本地终止，但 Messages 请求会原样转发给 Anthropic。
 
 模式保存在 `claudeCode.desktopMode`。此前明确应用第一方模式或在本版本之前应用过
 第一方模式的安装会保留该模式；现有网关安装也保持不变。没有明确设置时，依次检查
 OpenCodex 拥有的已选网关条目、保存的网关指纹、`settings.json` 中属于 OpenCodex 的
-第一方设置；都没有时使用网关。目录同步和模型列表更新绝不会在已解析为第一方模式的
+第一方设置；都没有时使用网关。仅为 CLI 第一方模式写入的环境变量，不能证明 Desktop 处于第一方模式。目录同步和模型列表更新绝不会在已解析为第一方模式的
 安装上写入网关配置档案。若 `claudeCode.intercept.enabled: false`，现有第一方安装的
 应用操作会以 `intercept_disabled` 拒绝，新安装则应用网关。不会覆盖其他代理的设置。
 切换模式后请完全退出并重新打开 Desktop。
+
+### Claude Code CLI 第一方模式
+
+在 Claude → Code 中开启 CLI 开关，或运行 `ocx claude config set --first-party on`；关闭时用 `off`。若本地代理不可用、CA 无法准备、设置无法读取，或代理键由其他程序所有，开启请求会被拒绝。关闭操作始终可以保存。仅开启 Desktop 第一方模式时，要让终端完全原生直连，请在 shell 中设置 `NO_PROXY='*'`。上述账户风险也适用于 CLI。
+关闭 Claude 路由会保留由 OpenCodex 管理的代理设置。监听器仍运行时，所有 Messages 请求原样转发；停止后，运行 OpenCodex 或关闭 Desktop/CLI 第一方模式之前，直接运行 `claude` 无法连接。`ocx claude` 原生启动仅在有自有设置且未继承外部 HTTPS 代理时设置 `NO_PROXY=*`。否则保留外部代理，并警告设置中的拦截仍生效；请关闭第一方模式或取消该设置。
+界面区分设置不可读（unknown）、带 opencodex 令牌的代理 URL 却搭配外部 CA（foreign：手动修正 HTTPS_PROXY / NODE_EXTRA_CA_CERTS），以及 Claude 路由已关闭但仍有监听器原样转发请求（disabled：重启前关闭第一方模式以清除设置）。没有监听器时为 stopped；使用受管理的 CA 但端口或令牌不匹配时为 broken。第一方模式开启但无法提供拦截服务时，stopped 和 broken 都显示 routingOff：Claude 路由或拦截功能已关闭，或此设备是另一台 opencodex 中枢的客户端；请在此设备上重新启用拦截服务，或关闭第一方模式以移除设置。仅在拦截服务可用时，stopped 才提示启动 opencodex，broken 才提示运行 `ocx ensure` 或重启。CLI 已开启但没有代理设置为未应用；仅开启一个客户端且代理正常时提示共享转发；两个客户端都关闭但代理设置仍在时提示残留。
+unknown 表示 opencodex 无法确定设置是否仍指向自己的代理。外部 CA 搭配 127.0.0.1 上无令牌的代理时显示 local：归属无法确认；如果不再使用，请从 ~/.claude/settings.json 中删除 HTTPS_PROXY。disabled 仅在设置与运行中的监听器匹配时出现；端口或令牌不匹配时，即使路由关闭也显示 broken。
 
 ### Picker 模式：在第一方 Code 标签页中显示 opencodex 模型
 
 Picker 模式是第一方模式的一部分。在 macOS 上选择第一方时默认开启；设置
 `claudeCode.intercept.picker: false` 后会保持关闭。它会修改第一方 Desktop 的 Code 标签页模型选择器，
 按名称列出可用的 opencodex 模型。首次开启时，macOS 可能会要求你在登录钥匙串中信任本地证书颁发机构。
-该颁发机构限制为 `claude.ai` 及其子域名；这个提示是对该本地 CA 的一次性信任步骤。
+该颁发机构限制为 `claude.ai` 及其子域名。其签名密钥只存在于运行中的 OpenCodex 进程内，因此每次重启
+OpenCodex 都会发布新的颁发机构，macOS 也会再次请求信任——请在每次重启后批准该提示，或稍后运行
+`ocx claude desktop picker trust`。
 
 Picker 模式开启期间，Claude Desktop 通过 OpenCodex 访问网络。如果 OpenCodex 停止，Desktop 会处于离线状态，
 直到你完全重启 Desktop 或关闭 Picker 模式。使用 `ocx claude desktop picker status` 查看状态，使用
@@ -232,10 +237,10 @@ Claude Code 2.1.278 接受包含 `claude` 或 `anthropic` 的 ID。以 `claude-`
 | 界面 | 格式 | 示例 |
 | --- | --- | --- |
 | Claude Code CLI | `ocx-claude-<provider>--<model>`（plain）或 `ocx-claude2-…`（escaped） | `ocx-claude-native--gpt-5.6-sol` |
-| Claude Desktop 3P | `claude-opus-4-8-<code>`（3 字符 base36 哈希） | `claude-opus-4-8-ncb` |
+| Claude Desktop 3P | `claude-opus-4-8-p<code>`（3 字符 base36 配置槽） | `claude-opus-4-8-p01q` |
 
 代理会按请求选择别名族：`?ids=cli` 或 `?ids=desktop` 优先；否则，`claude-code/*`
-user-agent 会获得易读的 CLI 形式，其他客户端会获得 Desktop 哈希形式。两种别名族都会永久
+user-agent 会获得易读的 CLI 形式，其他客户端会获得 Desktop 代码形式。两种别名族都会永久
 保持可解码——以任一形式保存在 `settings.json` 中的模型都能继续工作。
 
 如果 Claude Desktop 底部的选择器没有切换正在进行的 3P 对话的模型，可以尝试
@@ -304,6 +309,8 @@ v1 别名按字面解码（历史上 model ID 中包含的两字符序列 `~s` /
 `ANTHROPIC_MODEL`、四个 `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`，以及旧版
 `ANTHROPIC_SMALL_FAST_MODEL`。有效 Haiku 值为 `tierModels.haiku ?? smallFastModel`，并会
 提供给两个 Haiku 变量。
+
+以订阅模式启动 `ocx claude` 时，Claude Code 自身的登录会把 `claude-sonnet-5` 这类裸 Claude ID 直接发送给 Anthropic，因此无论其他提供方为同一 ID 列出什么，这些 ID 的上下文窗口都取自提供方注册表。未设置的 Opus、Sonnet 或 Fable 槽位会填入 Claude Code 为该别名解析出的原生 ID，并带上 `[1m]` 标记，因为在网关之后，Claude Code 会把不带标记的 ID 按 200k 计算。上限低于 1M 的 `anthropic` 行或 `claudeCode.modelMap` 条目会让对应 ID 保持无标记，Haiku 永远不会被填入或标记。以代理认证启动或关闭 `nativePassthrough` 时，由路由器决定，只有路由行的窗口生效。系统环境和 shell 文件会让未设置的槽位保持为空，因为它们的值也会传到经由 hub 的启动。
 
 当 `tierModels.haiku` 和 `smallFastModel` 均未设置时，OpenCodex 会让两个辅助模型变量保持未设置；随后 Claude Code 会选择其原生辅助模型（目前为 Sonnet），并可能产生原生提供方费用。
 
@@ -551,3 +558,7 @@ Claude 模型时自动加载。对于原生透传，这是正常现象；对于�
 在 `config.json` 中设置 `claudeCode.stabilizePromptCache: true`，可在转换路由上将系统指令末尾受支持的 Claude 提示移到最后一条用户消息。默认值为 `false`。仅在客户端允许这种角色变化时启用。代码围栏内的示例和不匹配的文本会保留，Anthropic 原生透传不变。没有元数据时，缓存键按稳定后的指令计算。该选项不会生成会话标识，也不保证上游缓存命中。
 
 在所有转换后的 Chat 路由上，时间线提醒都会保留在对话中的原有位置（排在尚待返回的工具结果之后）。因此，追加提醒不会重写开头的系统提示，对话中途的指令也不会被挪到它本应跟随的轮次之前。该位置携带哪个角色是单独决定的：除非提供方记录了 `foldDeveloperRoleToSystem: false`，否则提醒以 `system` 发送；该记录表示上游接受 `developer` 角色，此时提醒在同一位置按原样转发。不接受该角色的上游会返回 `400 role 'developer' is not allowed`，这一轮根本无法开始，所以未记录的目的地采用折叠。无论 `stabilizePromptCache` 是否启用，该行为都会生效；Anthropic 原生透传保持不变。缓存复用仍需要稳定的会话标识和可用的上游缓存。修改较早的指令或工具、压缩对话也可能影响缓存命中；仅保留提醒顺序并不保证缓存复用。
+
+### 第一方模型选择器的上下文标记
+
+对于权威上下文窗口至少为一百万 token 的路由模型，Desktop Code 标签页的模型选择器会添加 `[1m]`，使 Claude 按 1M 窗口计量，而不是使用自定义模型较小的默认窗口。标签、配置中的顺序和提供方路由保持不变。窗口未知或小于一百万 token 的模型（包括原生模型的大窗口选项）不添加标记，因为选择器无法保证 Desktop 或远程运行器收到配套的压缩环境设置。`ocx claude` 的自动上下文与压缩配套设置保持不变。现有对话会保留已保存的选择器，直到你在刷新后的模型选择器中重新选择该模型。

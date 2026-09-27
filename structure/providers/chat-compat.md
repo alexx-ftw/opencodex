@@ -279,9 +279,9 @@ but rejected hosted `web_search` with HTTP 400 `unsupported_request`, which mean
 prompt failed before the model answered, because Codex's hosted declaration travelled with it. A
 provider nobody has classified can now describe itself in config.
 
-The declaration is additive to that table, not a replacement for it. The table still covers
-destinations that reject a tool regardless of configuration, so an operator who never heard of the
-field stays protected; a declaration can only deny more, never re-enable a known-broken pairing.
+The declaration is additive to that table, not a replacement for it. The table is for destinations that reject a tool regardless of configuration, so an operator who never heard of the field stays protected;
+a declaration can only deny more, never re-enable a known-broken pairing. The table denies `web_search` and `web_search_preview` for `xiaomimimo.com` and its subdomains, including the public API and token-plan hosts (#5501), independent of model name. Matching uses the parsed URL hostname, so unrelated hosts with MiMo names in paths or queries are unaffected.
+OpenCode Go keeps hosted search: it refuses two OpenAI-private fields rather than the tool, and `src/adapters/xai-web-search.ts` normalizes those fields for every Grok model there.
 
 Two properties are deliberate. Spelling variants of one capability are aliased, so declaring
 `web_search` also denies `web_search_preview` — the rest of the proxy already folds that pair into
@@ -325,7 +325,11 @@ entry. `src/adapters/openai-chat/serialized-tool-call-content.ts` recognizes bar
 start of a line outside Markdown fences; inline, quoted and indented examples remain unchanged.
 It holds a possible serialized block, resumes ordinary text delivery when the header cannot match,
 and removes the block only when its function name and
-freeform body match a structured call's parsed `input` in the same response.
+freeform body match a structured call's parsed `input` or exact raw arguments from a declared
+freeform/custom tool in the same response. Valid JSON primitives, arrays, and objects can be raw
+freeform input too; the declared tool name and namespace determine whether the bridge would
+unwrap an alternate field, and JSON text that changes on dispatch is not treated as executed input.
+Malformed JSON on an ordinary function is not raw input.
 A block may close a freeform body with a stray `</parameter>` and may omit `</function>`, and one
 newline after the function header is template layout, so MiMo's echoes of those shapes match too
 (#5724). Blocks are read by delimiter scan in linear time: the first `</tool_call>` preceded by
@@ -334,12 +338,17 @@ of a line does the first `</tool_call>` close it, so a body can still carry lite
 If the gateway also prefixes the structured call's JSON
 arguments with the same freeform body, the adapter keeps the JSON suffix only when the block body,
 prefix, and wrapper's `input` value all agree. Mismatched markup and arguments remain byte-exact.
+MiMo V2 Chat IDs of `mimo-v2` or `mimo-v2.*` can send `{}` for a freeform call and put
+its input in one bare block; hyphenated IDs (`mimo-v2-pro`, `mimo-v2-omni`) are excluded. With no other text, one call and an exact wire-tool match, the adapter restores `input` and removes the block.
+Prose, fences, ordinary functions, multiple calls/blocks, and nonempty arguments remain inert. A malformed `<parameter=` opener is stripped only at that block's start; streaming recovery stops after earlier answer text is released.
 Two immediately adjacent identical bare blocks, with optional trailing whitespace after the pair,
 are suppressed only when exactly one structured call matches their function name and carries their
-body as `input`, either as one copy or as two copies joined directly or by one newline. Reducing a
-doubled `input` requires an arguments object with no keys besides `input`; extra keys leave it
-unchanged. Unrelated structured calls do not prevent suppression, and other repeated shapes remain
-unchanged.
+body as `input` or exact raw arguments, or when one doubled `input` can be reduced to that body.
+Reducing a doubled `input` requires an arguments object with no keys besides `input`; extra keys
+leave it unchanged. When another same-function call also matches or doubles the body, neither
+arguments nor markup are changed because the response is ambiguous. An empty block and its own
+empty-input call do not create a second explanation. Unrelated structured calls do not
+prevent suppression, and other repeated shapes remain unchanged.
 Silent held-content frames emit adapter heartbeats. Terminal errors and transport read failures
 drain all held text, including matching serialized blocks, because pending tools are not dispatched.
 The held bytes use the shared translator budget. The streaming hold is bounded (`ingestStreaming`): once a closed block is followed by more than 8 KiB of prose with no block open after it, or held text plus queued events would pass 4 MiB, everything held is released in order with nothing suppressed, so an unmatched block no longer delays the rest of the answer to the end of the turn. A duplicate is the tail of the content, so its reconciliation is unaffected; past either bound the stream prefers delivery (the pre-#5548 raw markup) over suppression. Buffered responses keep the unbounded `ingest` because their structured calls are already known (`tests/adapters/openai/openai-chat-serialized-tool-call-hold-bound.test.ts`). For a model opted into inline `<think>` splitting,
@@ -430,18 +439,15 @@ family shared by unrelated upstreams.
 
 ## Anthropic structured-output compatibility
 
-The Anthropic adapter lowers Responses `text.format` and Chat Completions `response_format` JSON
-Schema requests to `output_config.format`. The local transform follows Anthropic's TypeScript SDK
-subset so upstream rejects neither OpenAI-only envelope fields nor unsupported schema constraints.
-The adapter merges `format` into an existing adaptive-thinking `output_config` rather than replacing
-it, so a compatible `output_config.effort` remains alongside the structured-output format.
-Routed Anthropic Messages input carries `output_config.format` through internal `text.format`, so
-stored-OAuth requests regain the same native format when the Anthropic adapter rebuilds the wire body.
-Unsupported constraints remain in `description` as model guidance instead of disappearing. Root
-`$defs` stay beside a root `$ref`, intentionally differing from the current SDK transform's early
-`$ref` return so local references remain resolvable.
+The Anthropic adapter lowers Responses `text.format` and Chat Completions `response_format` JSON Schema requests to `output_config.format`, following Anthropic's TypeScript SDK subset.
+It merges `format` into the existing adaptive-thinking `output_config`, preserving compatible `output_config.effort`. Unsupported constraints remain in `description` as model guidance; root `$defs` remain beside a root `$ref` so local references resolve.
+Routed Anthropic Messages input carries `output_config.format` through internal `text.format`; stored-OAuth requests regain that format when the Anthropic adapter rebuilds the wire body.
+In that inbound direction, `src/adapters/anthropic-output-schema.ts` checks the original schema, not the normalized acceptance clone. Strict mode requires an object root without a root union, and every object must supply a property map, `additionalProperties: false`, and exactly matching `required` names.
+The check traverses schema-valued properties, array items, unions and definitions; property names and literal enum/const values are not schema nodes. It admits only documented schema keywords for the node's declared type, so incomplete objects, unknown constraints and invalid keyword values retain their original schema with explicit `strict: false` instead of waiting for a denylist update. Fine-tuned `ft:` targets use OpenAI's narrower model-specific keyword subset after Claude alias/model-map resolution; later provider/combo routing remains outside this ingress proof. Anthropic's native acceptance still includes `uri`; only the translated OpenAI strict claim uses the narrower set.
+`tests/claude-integration/claude-output-schema-strict.test.ts` covers the acceptance probe, inbound format, translated Responses parser, recursive object controls and caller-schema preservation.
 
 > Decision record: [ADR-0066](../decisions/ADR-0066-anthropic-structured-output-compatibility.md)
+> Decision record: [ADR-5901](../decisions/ADR-5901-translated-output-schema-strict-eligibility.md)
 
 ## Reasoning display parity (hideThinkingSummary)
 
@@ -491,6 +497,14 @@ credential failover receives the provider's configured placeholder instead of an
 reasoning.
 
 > Decision record: [ADR-0068](../decisions/ADR-0068-reasoning-display-parity-hidethinkingsummary.md)
+
+`src/chat/inbound.ts` translates legacy Chat `functions`, assistant `function_call`, and textual
+`role: "function"` results as one Responses function exchange. Missing or null assistant
+`function_call` fields mean no call and preserve ordinary assistant text. The translator assigns
+bounded sequential call IDs and pairs results by function name; malformed or orphan results fail
+explicitly, and image-bearing legacy results remain unsupported rather than losing media.
+
+> Decision record: [ADR-0111](../decisions/ADR-0111-legacy-chat-function-history.md)
 
 ## Chat streamed tool-call identity
 
@@ -579,3 +593,5 @@ Canonical Responses identity sanitation and narrowly scoped pre-output combo rec
 Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 
 Unicode pattern normalization uses [copy-on-write traversal](../transports/byte-accounting.md#unicode-pattern-normalization) while preserving the existing schema and wire semantics.
+
+DeepSeek Artifact compatibility: `src/adapters/openai-chat/tool-schema.ts` omits schema `pattern` and `anyOf` constraints and strict mode for unnamespaced `Artifact` tools on `api.deepseek.com`. Surrounding properties and required fields remain; union-only nodes become unconstrained, so tool execution must validate inputs. Property names, literal defaults/examples, and caller schemas are preserved; other tools and hosts retain existing normalization. `tests/providers/deepseek-artifact-tool-schema.test.ts` checks the serialized request.

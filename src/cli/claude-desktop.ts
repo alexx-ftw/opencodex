@@ -53,10 +53,12 @@ function printDesktopHelp(): void {
   console.log(`Usage:
   ocx claude desktop [apply] [--first-party | --gateway [--static|--hybrid|--discovery-only]]
       --gateway      (default) install the third-party gateway profile for the whole app
-      --first-party  keep Desktop on claude.ai; route only the Code tab's Claude Code through the
-                     local intercept proxy via ~/.claude/settings.json env. Account risk: this sends
-                     Claude subscription traffic through a local interception proxy, and Anthropic
-                     may suspend the account.
+      --first-party  keep Desktop on claude.ai; route its Code tab through the local
+                     intercept proxy via shared ~/.claude/settings.json env. A standalone
+                     claude CLI also reads that env and transits the proxy unchanged when
+                     CLI first-party is off. For fully native shell use, set NO_PROXY='*'.
+                     Account risk: Claude subscription traffic crosses local TLS interception;
+                     Anthropic may suspend the account.
   ocx claude desktop show [--json]
   ocx claude desktop status [--json]
   ocx claude desktop picker on|off|status|trust
@@ -134,23 +136,36 @@ function persistPickerPreference(value: boolean): boolean {
   return outcome.status !== "unavailable";
 }
 
-function pickerTrustPaths(deps: ApplyProfileDeps, configDir = getConfigDir()): { caPath: string; leafPath: string; sha1: string } {
-  const ca = (deps.ensurePickerCaImpl ?? ensurePickerCa)(configDir);
+function pickerTrustPaths(deps: ApplyProfileDeps, configDir = getConfigDir()): { caPath: string; leafPath: string; sha1: string; certPem: string } {
+  const caPath = pickerCaCertPath(configDir);
+  const certPem = deps.ensurePickerCaImpl
+    ? deps.ensurePickerCaImpl(configDir).certPem
+    : readFileSync(caPath, "utf8");
   return {
-    caPath: pickerCaCertPath(configDir),
+    caPath,
     leafPath: pickerLeafCertPath(configDir),
-    sha1: pickerCaFingerprints(ca.certPem).sha1,
+    sha1: pickerCaFingerprints(certPem).sha1,
+    certPem,
   };
 }
 
-async function trustPickerLocally(deps: ApplyProfileDeps): Promise<{ ok: true; callerAddedTrust: boolean; caPath: string; sha1: string } | { ok: false; reason: string }> {
+async function trustPickerLocally(
+  deps: ApplyProfileDeps,
+  expectedCaSha256?: string | null,
+): Promise<{ ok: true; callerAddedTrust: boolean; caPath: string; sha1: string } | { ok: false; reason: string }> {
   try {
     const configDir = getConfigDir();
     const paths = pickerTrustPaths(deps, configDir);
+    if (!deps.ensurePickerCaImpl) {
+      // The bytes in ca.pem are only safe to trust when they match the authority the running
+      // server actually owns — a replaced file must never land in the login keychain.
+      const live = pickerCaFingerprints(paths.certPem).sha256;
+      if (expectedCaSha256 == null || expectedCaSha256 !== live) return { ok: false, reason: "ca_unverified" };
+    }
     const inspect = deps.inspectPickerTrustImpl ?? inspectPickerTrust;
     const before = await inspect(paths.leafPath, paths.sha1, deps.security, deps.platform);
     if (before === "trusted") return { ok: true, callerAddedTrust: false, caPath: paths.caPath, sha1: paths.sha1 };
-    const trust = await (deps.trustPickerCaImpl ?? trustPickerCa)(paths.caPath, deps.security, deps.platform);
+    const trust = await (deps.trustPickerCaImpl ?? trustPickerCa)(paths.caPath, deps.security, deps.platform, { pem: paths.certPem });
     if (!trust.ok) return { ok: false, reason: trust.reason ?? "trust_declined" };
     return { ok: true, callerAddedTrust: true, caPath: paths.caPath, sha1: paths.sha1 };
   } catch (error) {
@@ -353,7 +368,7 @@ export function gatewayModeExplanation(input: {
       : "because gateway is the default for Claude Desktop";
   return [
     `Applied the gateway profile ${reason}.`,
-    "First-party keeps Desktop on your claude.ai account and routes only the Code tab through the local proxy:",
+    "First-party keeps Desktop on your claude.ai account and routes its Code tab through the local proxy. The standalone claude CLI reads the same settings env and may transit the proxy unchanged; use NO_PROXY='*' in the shell for fully native traffic:",
     "  ocx claude desktop apply --first-party",
     `Account risk: ${FIRST_PARTY_ACCOUNT_RISK.message}`,
   ];
@@ -425,9 +440,12 @@ export async function applyDesktop(
   const modeSaved = saveDesktopMode("gateway", deps);
   const warning = [result.warning, modeSaved ? "" : "desktop mode marker was not saved"].filter(Boolean).join(" ");
   // The gateway mode is committed before retiring first-party settings.
-  const removed = removeDesktopFirstParty();
+  const removed = removeDesktopFirstParty(loadConfig());
   if (!removed.ok) return { ok: false, path: removed.path, reason: "first_party_settings_unreadable",
     warning: ["gateway applied; first-party cleanup remains incomplete", warning].filter(Boolean).join(" ") };
+  if (removed.retainedFor === "cli") {
+    return { ...result, warning: [warning, "Shared first-party settings remain for Claude Code CLI."].filter(Boolean).join(" ") };
+  }
   if (warning) return { ...result, warning };
   return result;
 }
@@ -592,17 +610,28 @@ async function handleClaudeDesktopPickerCommand(
   });
 
   if (action === "trust") {
-    const trusted = await trustPickerLocally(deps);
+    if (!(await liveDesktopProxy(deps))) {
+      console.error("proxy_unavailable");
+      return 1;
+    }
+    // Verify the published CA file against the authority the live server reports — the status
+    // response carries caSha256, and a first enable materializes one when none exists yet.
+    let caSha256: string | null;
+    try {
+      caSha256 = (await pickerRuntimeRequest<{ ok?: boolean; picker?: DesktopPickerStatus }>(
+        "/api/claude-desktop/picker", {}, deps,
+      )).picker?.caSha256 ?? null;
+      if (caSha256 === null) caSha256 = (await sendEnable(false)).picker?.caSha256 ?? null;
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+    const trusted = await trustPickerLocally(deps, caSha256);
     if (!trusted.ok) {
       console.error(trusted.reason);
       return 1;
     }
     localTrust = trusted;
-    if (!(await liveDesktopProxy(deps))) {
-      await compensateLocalPickerTrust(localTrust, deps);
-      console.error("proxy_unavailable");
-      return 1;
-    }
   }
 
   let response: PickerRouteResponse;
@@ -614,7 +643,7 @@ async function handleClaudeDesktopPickerCommand(
       return 1;
     }
     if (action === "on" && response.picker?.reason === "trust_pending") {
-      const trusted = await trustPickerLocally(deps);
+      const trusted = await trustPickerLocally(deps, response.picker.caSha256);
       if (!trusted.ok) {
         console.error(trusted.reason);
         return 1;

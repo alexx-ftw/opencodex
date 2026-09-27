@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as z from "zod/v4";
+import { compactionRecoveryConfigError } from "./schema/compaction-recovery";
 import type { OcxConfig } from "../types";
 import { configReasoningPinsConfigError } from "./provider-validation";
 import { loopbackCompanionAllowed } from "../codex/loopback-target";
@@ -62,6 +63,7 @@ import {
   runtimeRoleSchema,
   spendSchema,
   compactionRoutingSchema,
+  skillsConfigSchema,
 } from "./schema/leaf-validators";
 
 export type ConfigDiagnostics = {
@@ -593,12 +595,23 @@ export function metricsExportConfigError(value: unknown): string | null {
   return null;
 }
 
+
+function skillsConfigError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "skills") || raw.skills === undefined) return null;
+  const result = skillsConfigSchema.safeParse(raw.skills);
+  if (result.success) return null;
+  const issue = result.error.issues[0];
+  const field = issue?.path.join(".");
+  return "schema_invalid: skills" + (field ? "." + field : "") + ": " + (issue?.message ?? "invalid configuration");
+}
+
 export function validateConfigCandidate(value: unknown): { ok: true; config: OcxConfig } | { ok: false; error: string } {
   const compactionRouting = rawConfigRecord(value)?.compactionRouting;
   if (compactionRouting !== undefined && !compactionRoutingSchema.safeParse(compactionRouting).success) {
     return { ok: false, error: "schema_invalid: compactionRouting: requires a nonblank model, an optional valid reasoningEffort, and optional non-repeating triggers drawn from \"manual\" and \"auto\"" };
   }
-  const boundaryError = configReasoningPinsConfigError(value)
+  const boundaryError = compactionRecoveryConfigError(value) ?? configReasoningPinsConfigError(value)
     ?? blankHostnameError(value)
     ?? claudeSubagentEffortError(value)
     ?? appOwnedMemoryBudgetError(value)
@@ -624,7 +637,8 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? clientRolePairError(value)
     ?? loopbackListenerPortError(value)
     ?? managementIngressConfigError(value)
-    ?? metricsExportConfigError(value);
+    ?? metricsExportConfigError(value)
+    ?? skillsConfigError(value);
   if (boundaryError) return { ok: false, error: boundaryError };
   const result = configSchema.safeParse(value);
   if (result.success) {

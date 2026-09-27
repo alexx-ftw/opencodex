@@ -1,5 +1,19 @@
 # Responses Wire Shapes
 
+## Direct MCP calls in code mode
+
+On routed bridge or converted-custom passthrough paths, when the request declares a
+freeform/custom code-mode `exec`, a structured call to
+`mcp__<server>__<tool>` can be restored as an `exec` call to the matching nested host tool.
+The same applies to a provider-added `default.` prefix when neither explicit `default.` nor
+`default__` identity was declared.
+The request must carry verified custom-tool provenance: an ordinary JSON function named
+`exec` does not authorize this repair. Explicitly declared MCP tools keep their identity,
+legacy shell catalogs stay unchanged, and unknown nested tools fail at the host.
+Names and arguments are serialized as data; plain-text tool-call transcripts are never
+promoted into executable calls by this rule. Native forwarding and injection lack this
+restoration step, so their undeclared-tool guard still rejects a direct MCP call.
+
 Per-wire request and stream shapes on the Responses data plane: mixed-wire model defaults, xAI
 agent-message continuation, declared-tool membership by inbound wire, and passthrough SSE stream
 shapes. The endpoint, dispatch, and credential rules they build on are in
@@ -447,7 +461,7 @@ caller's abort signal, so a `connectTimeoutMs` shorter than 90 seconds cancels
 an already-sent create before the prelude timer fires.
 These are transport-fidelity guarantees, not a provider-billing guarantee.
 
-Every exchange also leaves a content-free stage record (`CodexWsStageRecord`, #4191): create-frame bytes (measured on failure only — the committed-success record keeps it null so the happy path never byte-counts a megabyte replay frame), send completion, numeric close code, elapsed and first-frame durations, frame counters, liveness ping/pong counts, pool reuse, and the OCX/Bun versions. The exchange pins the record on the resolved Response (`markCodexWsStage`, the same marker seam as `markCodexWsResponse`); `handleResponses` adopts it onto the serving attempt, and usage.jsonl persists it per attempt behind a drop-guard normalizer, so hand-edited rows cannot inject strings into the DTO. Later snapshots update the same response-local record in place, so an attempt holding the committed reference observes final success or failure counters. Each exchange supplies a complete fresh snapshot; separate responses keep distinct records. On eager-relay cancel-drain expiry, upstream cancellation finalizes the transport snapshot before the cancellation hook writes the usage row; an actual terminal observed within the drain still wins over cancellation. The record never carries conversation text, headers, close-reason text, or account identifiers, and it is not a fallback-eligibility signal: nothing it says permits a resend. The one replacement an operator can grant after a socket dies is the resend gate's decision (see [ambiguous-resend gate](responses-failover.md#ambiguous-resend-gate)).
+Every exchange also leaves a content-free stage record (`CodexWsStageRecord`, #4191): create-frame bytes (measured on failure only — the committed-success record keeps it null so the happy path never byte-counts a megabyte replay frame), send completion, numeric close code, elapsed, first-frame and first-response-event durations, frame counters, liveness ping/pong counts, pool reuse, and the OCX/Bun versions. The exchange pins the record on the resolved Response (`markCodexWsStage`, the same marker seam as `markCodexWsResponse`); `handleResponses` adopts it onto the serving attempt, and usage.jsonl persists it per attempt behind a drop-guard normalizer, so hand-edited rows cannot inject strings into the DTO. Later snapshots update the same response-local record in place, so an attempt holding the committed reference observes final success or failure counters. Each exchange supplies a complete fresh snapshot; separate responses keep distinct records. On eager-relay cancel-drain expiry, upstream cancellation finalizes the transport snapshot before the cancellation hook writes the usage row; an actual terminal observed within the drain still wins over cancellation. The record never carries conversation text, headers, close-reason text, or account identifiers, and it is not a fallback-eligibility signal: nothing it says permits a resend. The one replacement an operator can grant after a socket dies is the resend gate's decision (see [ambiguous-resend gate](responses-failover.md#ambiguous-resend-gate)).
 
 Eligible complete-input creates can retain a canonical upstream socket within
 one selected account, credential, thread and turn. Model/tier and immutable
@@ -511,9 +525,11 @@ JavaScript. Ordinary JavaScript stays progressive. Coverage: `tests/responses/re
 An explicit custom-tool denial also requests recovery for unmapped historical results without a live
 catalog; history never adds current tool authorization. The custom-tool compatibility contract owns
 lowering and final validation. Muse may wrap an already-flattened namespace identity such as
-`default.mcp__server__tool` only when the complete suffix exactly matches a declared namespaced name
-and neither explicit `default.` nor `default__` identity exists. It cannot borrow a manufactured bare
-alias; unknown suffixes still fail as undeclared tools. See [ADR-0099](../decisions/ADR-0099-responses-http-sse.md).
+`default.mcp__server__tool` when the complete suffix exactly matches a declared namespaced name
+and neither explicit `default.` nor `default__` identity exists. The custom code-mode `exec`
+recovery above is a separate path for undeclared direct MCP names. Neither path can borrow a
+manufactured bare alias. Outside code mode, unknown suffixes fail as undeclared tools; inside
+code mode, the host rejects unknown nested tools. See [ADR-0099](../decisions/ADR-0099-responses-http-sse.md).
 
 > Decision record: [ADR-0099](../decisions/ADR-0099-responses-http-sse.md)
 
@@ -533,3 +549,18 @@ summary choices remain intact. Raw display and hidden-envelope replay follow
 [reasoning display parity](../providers/chat-compat.md#reasoning-display-parity-hidethinkingsummary).
 Final-route normalization preserves visible raw reasoning when the parsed request has a validated
 active effort and omits summary; explicit `summary: "none"` still hides it.
+
+## Codex App visualization references
+
+The Codex App draws an inline visualization from `U+E200 visualize U+E202 {json} U+E201` in an
+assistant message, and its renderer turns that span into the plain directive
+`::codex-inline-vis{path="…"}` before parsing. Several providers drop private-use characters before
+the model reads them (every Claude route checked), so the model saw and repeated a bare
+`visualize{…}` the app printed verbatim. `src/responses/visualization-directives.ts` rewrites each
+such span in the parsed context — system prompt, string content and text parts of every role — into
+that ASCII directive, following the app's own payload rules, and `parseRequest` applies it to the
+context it returns. `_rawBody` is not touched, so native passthrough stays byte-identical and stored
+`previous_response_id` history keeps the original text. The citation filter in
+`src/responses/citation-markers.ts` is separate and never removes these spans (#6040).
+`tests/responses/visualization-directives.test.ts` pins the payload rules, the linear-time scan and
+the parser and Anthropic request paths.

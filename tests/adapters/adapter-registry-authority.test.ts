@@ -25,6 +25,7 @@ const EXPECTED_ADAPTER_NAMES = {
   "mimo-free": "mimo-free",
   "zcode-start-plan": "zcode-start-plan",
   qoder: "qoder",
+  "claude-cli": "claude-cli",
 } as const;
 
 function provider(adapter: string): OcxProviderConfig {

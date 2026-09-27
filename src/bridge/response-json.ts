@@ -49,7 +49,13 @@ import { bridgeToResponsesSSE } from "./sse";
 export function buildResponseJSON(
   events: AdapterEvent[],
   modelId: string,
-  options?: Parameters<typeof buildResponseJSONWithBudget>[2],
+  options?: Parameters<typeof buildResponseJSONWithBudget>[2] & {
+    /**
+     * False when the body is not what the client receives: a direct client encoder counts its
+     * own relayed frames and folds the same events here only for the completion effects.
+     */
+    recordBufferedDelivery?: boolean;
+  },
 ): Record<string, unknown> {
   // Default-budget safety net: a caller that omits the budget gets a bounded
   // default (disposed with the call), never the unbounded append path.
@@ -58,7 +64,9 @@ export function buildResponseJSON(
     // A buffered turn delivers its whole answer as one body, so nothing calls the per-frame
     // recorder on the SSE bridge. Without this the attempt would persist adapter events with
     // zero relayed ones, which is the loss signal -- raised on every non-streaming request.
-    attemptDeliveryRecorder(options.translatorBudget)?.noteBufferedDelivery(body);
+    if (options.recordBufferedDelivery !== false) {
+      attemptDeliveryRecorder(options.translatorBudget)?.noteBufferedDelivery(body);
+    }
     return body;
   }
   const budget = createTranslatorBudget();
@@ -78,6 +86,8 @@ function buildResponseJSONWithBudget(
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
     /** Request-visible tool names. Required for client calls when enforcement is explicitly enabled. */
     declaredToolNames?: ReadonlySet<string>;
+    /** Bare custom declarations; unlike freeformToolNames, excludes foreign namespace children. */
+    bareCustomToolNames?: ReadonlySet<string>;
     /** See `bridgeToResponsesSSE`: enforcement is separate from normalization (#4735). */
     enforceDeclaredToolNames?: boolean;
     /** Declared parameter schema per tool name; repairs integral-float integer args (#1611). */
@@ -443,7 +453,7 @@ function buildResponseJSONWithBudget(
           rememberReasoningForCall(e.id, rawReasoningForNextToolCall, replayCacheScope);
         }
         flushToolCall();
-        const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames);
+        const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames, undefined, options?.bareCustomToolNames);
         if (
           (options?.enforceDeclaredToolNames === true || options?.declaredToolNames != null)
           && options?.enforceDeclaredToolNames !== false

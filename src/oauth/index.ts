@@ -22,11 +22,12 @@ import {
   mergeAccountCredential,
   normalizeAuthStoreBuffer,
   readOAuthRefreshIntent,
-  removeAccount,
+  rollbackCredentialWriteIfMatch,
   saveAccountCredential,
   saveCredential,
-  setActiveAccount,
+  saveCredentialWithReceipt,
   writeOAuthRefreshIntent,
+  type OAuthCredentialWriteReceipt,
   type OAuthRefreshIntent,
   type OAuthRefreshIntentCleanupPending,
 } from "./store";
@@ -53,7 +54,7 @@ import { resolveProviderTransport } from "../providers/xai-transport";
 import { detectClaudeCodeToken, detectGrokCliToken, hasComparableGrokIdentity, isSameGrokIdentity, shouldAdoptGrokGeneration } from "./local-token-detect";
 import { logOAuthEvent } from "./log";
 import { captureConfigGeneration, sweepExpiredOnWrite } from "../lib/state-store-sweeper";
-import { clearManualCodeSlot, ensureManualCodeSlot, kiroLoginSettling, loginAbort, loginState, waitForManualLoginCode } from "./login-flow-state";
+import { clearManualCodeSlot, ensureManualCodeSlot, kiroLoginSettling, loginAbort, loginState, waitForManualLoginCode, type OAuthLoginHint } from "./login-flow-state";
 export { reconcileOAuthFlowState, submitManualLoginCode } from "./login-flow-state";
 import { randomUUID } from "node:crypto";
 export {
@@ -475,7 +476,7 @@ export function publicOAuthAuthenticationErrorMessage(error: unknown): string {
   return "OAuth authentication failed. Check the OpenCodex account status and retry.";
 }
 
-function accessSnapshot(provider: string, accountId: string, cred: OAuthCredentials): OAuthAccessSnapshot {
+function accessSnapshot(provider: string, accountId: string, cred: OAuthCredentials, oauthProvider = provider): OAuthAccessSnapshot {
   // Derived, not read back: a stored `authType` is trusted when present, but a credential imported
   // before the field existed still routes correctly because the client pair implies SSO OIDC.
   const kiroAuthType = cred.kiro?.authType
@@ -493,9 +494,11 @@ function accessSnapshot(provider: string, accountId: string, cred: OAuthCredenti
   // Validated here, not at the call site: an unvalidated origin from a legacy or crafted
   // credential must never travel with a bearer, and dropping it makes the transport fall back to
   // the canonical host rather than to whatever the previous account was using.
-  const accountApiBaseUrl = provider === "github-copilot"
+  // The host rides on the OAuth definition the snapshot was resolved through, not the routed
+  // slot name: a custom provider reusing the Devin definition keeps its stored tenant URL.
+  const accountApiBaseUrl = oauthProvider === "github-copilot"
     ? validateCopilotApiBaseUrl(cred.apiBaseUrl)
-    : provider === "devin" || provider === "devin-cli"
+    : oauthProvider === "devin" || oauthProvider === "devin-cli"
       ? validateDevinApiBaseUrl(cred.apiBaseUrl)
       : undefined;
   return {
@@ -559,9 +562,10 @@ async function resolveAccessSnapshotForAccount(
   accountId: string,
   rejectedGeneration?: string,
   requireUsableAccount = false,
+  oauthProvider = provider,
 ): Promise<OAuthAccessSnapshot> {
-  const def = OAUTH_PROVIDERS[provider];
-  if (!def) throw new UnsupportedOAuthProviderError(provider);
+  const def = OAUTH_PROVIDERS[oauthProvider];
+  if (!def) throw new UnsupportedOAuthProviderError(oauthProvider);
   // One store read answers both questions. A caller that opts in gets the account REJECTED
   // when it needs reauthentication, which a bare credential read cannot detect: a revoked
   // account keeps a readable credential, so resolution would otherwise succeed and the
@@ -570,7 +574,7 @@ async function resolveAccessSnapshotForAccount(
   if (!row) throw new OAuthLoginRequiredError(provider);
   if (requireUsableAccount && row.needsReauth) throw new OAuthLoginRequiredError(provider);
   const cred = row.credential;
-  const current = accessSnapshot(provider, accountId, cred);
+  const current = accessSnapshot(provider, accountId, cred, oauthProvider);
   if (rejectedGeneration !== undefined && current.generation !== rejectedGeneration) return current;
   if (rejectedGeneration === undefined && cred.expires > Date.now() + REFRESH_SKEW_MS) return current;
 
@@ -604,7 +608,7 @@ async function resolveAccessSnapshotForAccount(
     if (persisted.access !== accessToken) {
       throw new Error(`OAuth refresh persisted an unexpected access token for ${provider}`);
     }
-    return accessSnapshot(provider, accountId, persisted);
+    return accessSnapshot(provider, accountId, persisted, oauthProvider);
   })().catch(error => {
     if (abort.signal.reason instanceof OAuthTokenRefreshStaleError) throw abort.signal.reason;
     throw error;
@@ -616,10 +620,13 @@ async function resolveAccessSnapshotForAccount(
   return refresh;
 }
 
-export async function getValidAccessTokenSnapshot(provider: string): Promise<OAuthAccessSnapshot> {
+export async function getValidAccessTokenSnapshot(
+  provider: string,
+  options: { oauthProvider?: string } = {},
+): Promise<OAuthAccessSnapshot> {
   const set = getAccountSet(provider);
   if (!set) throw new OAuthLoginRequiredError(provider);
-  return resolveAccessSnapshotForAccount(provider, set.activeAccountId);
+  return resolveAccessSnapshotForAccount(provider, set.activeAccountId, undefined, false, options.oauthProvider);
 }
 
 /** Providers whose upstream-401 replay path may force a snapshot refresh. */
@@ -1600,31 +1607,13 @@ export function upsertOAuthProvider(config: OcxConfig, provider: string): void {
 
 interface RunLoginDeps {
   saveCredential?: typeof saveCredential;
+  saveCredentialWithReceipt?: typeof saveCredentialWithReceipt;
   saveAccountCredential?: typeof saveAccountCredential;
   loadConfig?: typeof loadConfig;
   saveConfig?: typeof saveConfig;
   settleKiroLoginTransaction?: typeof settleKiroLoginTransaction;
-  removeAccount?: typeof removeAccount;
-  setActiveAccount?: typeof setActiveAccount;
+  rollbackCredentialWrite?: typeof rollbackCredentialWriteIfMatch;
   assertCurrentOwner?: () => void;
-}
-
-/** Roll back only accounts created by this forced login, preserving concurrent refreshes of others. */
-async function rollbackForcedKiroAccountWrite(
-  provider: string,
-  previousActiveId: string | undefined,
-  previousAccountIds: ReadonlySet<string>,
-  deps: Pick<RunLoginDeps, "removeAccount" | "setActiveAccount">,
-): Promise<void> {
-  const set = getAccountSet(provider);
-  if (!set) return;
-  for (const account of [...set.accounts]) {
-    if (previousAccountIds.has(account.id)) continue;
-    await (deps.removeAccount ?? removeAccount)(provider, account.id);
-  }
-  if (previousActiveId && getAccountCredential(provider, previousActiveId)) {
-    await (deps.setActiveAccount ?? setActiveAccount)(provider, previousActiveId);
-  }
 }
 
 /** Run the login flow, persist the credential + upsert the provider entry to disk, return cred. */
@@ -1649,12 +1638,14 @@ export async function runLogin(
   // loginKiro keys its pending CLI-session transaction by object identity. Keep this exact object
   // for settlement even when source normalization below creates a derived credential object.
   const shouldRollbackKiroAccounts = provider === "kiro" && opts?.forceLogin === true;
-  const previousKiroAccounts = shouldRollbackKiroAccounts ? getAccountSet(provider) : undefined;
-  const previousKiroActiveId = previousKiroAccounts?.activeAccountId;
-  const previousKiroAccountIds = new Set(previousKiroAccounts?.accounts.map(account => account.id) ?? []);
+  let kiroCredentialWrite: OAuthCredentialWriteReceipt | null = null;
   const loginProviderConfig = preflightConfig
     ? (def.resolveProviderConfig?.(preflightConfig) ?? preflightConfig.providers[provider] ?? def.providerConfig)
     : def.providerConfig;
+  if (provider === "kiro" && opts?.reauthAccountId
+    && getAccountSet("kiro")?.accounts.some(a => a.id === opts.reauthAccountId && a.loginOrigin === "kiro-device")) {
+    throw new Error("Native Kiro device accounts cannot be reauthenticated with kiro-cli; remove and re-add the account.");
+  }
   const rawCred = await def.login(ctrl, opts, loginProviderConfig);
   const cred: OAuthCredentials = rawCred.source ? rawCred : { ...rawCred, source: "oauth" };
   const settleKiroTransaction = deps.settleKiroLoginTransaction ?? settleKiroLoginTransaction;
@@ -1682,12 +1673,22 @@ export async function runLogin(
       }
       await (deps.saveAccountCredential ?? saveAccountCredential)(provider, opts.reauthAccountId, cred, {
         assertBeforePersist: deps.assertCurrentOwner,
+        rotateLoginId: true,
       });
     } else {
-      await (deps.saveCredential ?? saveCredential)(provider, cred, {
+      const saveOptions = {
         preserveIdentityless: opts?.forceLogin === true,
         assertBeforePersist: deps.assertCurrentOwner,
-      });
+      };
+      if (shouldRollbackKiroAccounts && !deps.saveCredential) {
+        kiroCredentialWrite = await (deps.saveCredentialWithReceipt ?? saveCredentialWithReceipt)(
+          provider,
+          cred,
+          saveOptions,
+        );
+      } else {
+        await (deps.saveCredential ?? saveCredential)(provider, cred, saveOptions);
+      }
     }
     if (provider !== "chatgpt") {
       // Re-run against post-credential state so same-provider API-key additions, removals,
@@ -1705,9 +1706,9 @@ export async function runLogin(
     }
   } catch (error) {
     const errors: unknown[] = [error];
-    if (shouldRollbackKiroAccounts) {
+    if (kiroCredentialWrite) {
       try {
-        await rollbackForcedKiroAccountWrite(provider, previousKiroActiveId, previousKiroAccountIds, deps);
+        await (deps.rollbackCredentialWrite ?? rollbackCredentialWriteIfMatch)(kiroCredentialWrite);
       } catch (rollbackError) {
         errors.push(rollbackError);
       }
@@ -1784,7 +1785,7 @@ export interface OAuthAccountSummary {
  * the config at its request boundary and resolves the policy there with `emailMaskingEnabled`.
  * The default masks, so every existing caller keeps today's behaviour.
  */
-export function getLoginStatus(provider: string, maskEmails = true): { loggedIn: boolean; email?: string; source?: OAuthCredentials["source"]; error?: string; done: boolean; activeAccountId?: string; accounts?: OAuthAccountSummary[] } {
+export function getLoginStatus(provider: string, maskEmails = true): { loggedIn: boolean; email?: string; source?: OAuthCredentials["source"]; error?: string; done: boolean; hint?: OAuthLoginHint; activeAccountId?: string; accounts?: OAuthAccountSummary[] } {
   const cred = getCredential(provider);
   const st = loginState.get(provider);
   const set = getAccountSet(provider);
@@ -1815,6 +1816,7 @@ export function getLoginStatus(provider: string, maskEmails = true): { loggedIn:
     source: cred?.source,
     error: st?.error,
     done: st?.done ?? false,
+    ...(st?.hint && !st.done ? { hint: { url: st.hint.url, instructions: st.hint.instructions, deviceCode: st.hint.deviceCode } } : {}),
     ...(set ? { activeAccountId: set.activeAccountId, accounts } : {}),
   };
 }
@@ -1869,8 +1871,15 @@ export async function startLoginFlow(
     let urlResolved = false;
     const ctrl: OAuthController = {
       onAuth: ({ url, instructions, deviceCode }) => {
-        urlResolved = true;
-        resolve({ url, instructions, deviceCode });
+        if (abort.signal.aborted || loginAbort.get(provider)?.controller !== abort) return;
+        // Device approval can fall back to manual input. Replace, never merge: the
+        // previous device code must disappear when the provider changes the next step.
+        const hint = { url, instructions, deviceCode };
+        loginState.set(provider, { done: false, hint });
+        if (!urlResolved) {
+          urlResolved = true;
+          resolve({ ...hint });
+        }
       },
       onProgress: () => {},
       // GUI fallback when the browser cannot hit the loopback callback server.

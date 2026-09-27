@@ -38,8 +38,10 @@ import {
 } from "./npm-cache-preflight.mjs";
 import { handoffWindowsTrayForUpdate, planWindowsTrayUpdate } from "./tray-update-plan.mjs";
 import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
+import { withoutSiblingMarker } from "../codex/sibling-start";
 import { packageVersion } from "../lib/package-version";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
+import { PNPM_READ_CWD, withPnpmCommandCwd, pnpmReadEnvironment } from "./pnpm-read-policy.mjs";
 
 /**
  * A `codex-history-backup-*.json` surviving a stop means the native-history restore was
@@ -84,8 +86,7 @@ function packageRoot(): string {
   return resolve(HERE, "..", "..");
 }
 
-function runningPnpmShimPath(): string | undefined {
-  const invoked = process.argv[1];
+function runningPnpmShimPath(invoked = process.argv[1]): string | undefined {
   if (!invoked) return undefined;
   const name = invoked.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
   if (!new Set(["ocx", "opencodex", "ocx.cmd", "opencodex.cmd", "ocx.ps1", "opencodex.ps1"]).has(name ?? "")) {
@@ -98,27 +99,33 @@ function runPnpmCandidate(
   commandPath: string,
   args: readonly string[],
   capture = false,
+  spawn: typeof spawnSync = spawnSync,
 ): { status: number | null; stdout?: string | null; stderr?: string | null } {
   const invocation = pnpmInvocationForPath(commandPath, args);
   if (!invocation) return { status: 1 };
-  return spawnSync(invocation.file, invocation.args, {
+  return spawn(invocation.file, invocation.args, {
     stdio: capture ? "pipe" : "ignore",
     encoding: "utf8",
     timeout: 20_000,
     windowsHide: true,
-    env: unprivilegedOwnershipMutationEnvironment(process.env),
+    cwd: PNPM_READ_CWD,
+    env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(process.env)),
     ...invocation.options,
   });
 }
 
 /** Resolve the exact pnpm executable/group/bin that own this package. */
-export function resolveCurrentPnpmGlobalOwner(): PnpmGlobalOwnerResult {
+export function resolveCurrentPnpmGlobalOwner(
+  invoked = process.argv[1],
+  deps: { commandPaths?: readonly string[]; spawn?: typeof spawnSync } = {},
+): PnpmGlobalOwnerResult {
+  const spawn = deps.spawn ?? spawnSync;
   return resolvePnpmGlobalOwner({
     packageName: PKG,
     packagePath: packageRoot(),
-    commandPaths: resolvePnpmCommands(),
-    runningShimPath: runningPnpmShimPath(),
-    runPnpm: runPnpmCandidate,
+    commandPaths: deps.commandPaths ?? resolvePnpmCommands(),
+    runningShimPath: runningPnpmShimPath(invoked),
+    runPnpm: (commandPath, args, capture) => runPnpmCandidate(commandPath, args, capture, spawn),
   });
 }
 
@@ -136,22 +143,26 @@ function ownerPnpmTarget(
   };
 }
 
-function runOwnedPnpm(
+export function runOwnedPnpm(
   owner: PnpmGlobalOwner,
   args: readonly string[],
   capture: boolean,
   stdio: "inherit" | "pipe" | "ignore" = capture ? "pipe" : "inherit",
+  spawn: typeof spawnSync = spawnSync,
 ): { status: number | null; stdout?: string | null; stderr?: string | null } {
   const target = ownerPnpmTarget(owner, args);
   if (!target) return { status: 1 };
-  return spawnSync(target.bin, target.args, {
+  return withPnpmCommandCwd(args, cwd => spawn(target.bin, target.args, {
     stdio,
     encoding: "utf8",
     timeout: 180_000,
     windowsHide: true,
-    env: unprivilegedOwnershipMutationEnvironment(target.env),
+    // Reads probe from the package dir; `add -g`/rollback children run from a neutral
+    // directory so a Windows cwd handle never pins open the package pnpm is replacing.
+    cwd,
+    env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(target.env)),
     ...target.options,
-  });
+  }));
 }
 
 /** Re-read the owning group's active package and return its verified launcher. */
@@ -192,6 +203,8 @@ type SpawnTarget = {
   env?: Record<string, string | undefined>;
 };
 
+export type RegistrySpawnTarget = SpawnTarget;
+
 function npmSpawnTarget(args: readonly string[]): SpawnTarget | null {
   const invocation = npmInvocation(args);
   if (!invocation) return null;
@@ -214,7 +227,7 @@ function pnpmSpawnTarget(args: readonly string[], owner?: PnpmGlobalOwner): Spaw
   return { bin: invocation.file, args: invocation.args, options: invocation.options };
 }
 
-function registrySpawnTarget(
+export function registrySpawnTarget(
   installer: Installer,
   args: readonly string[],
   owner?: PnpmGlobalOwner,
@@ -274,16 +287,20 @@ export function latestVersion(
   tag: string,
   installer: Installer = detectInstall(),
   owner?: PnpmGlobalOwner,
+  spawn: typeof spawnSync = spawnSync,
 ): string | null {
   const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
   if (installer === "pnpm" && !resolvedOwner) return null;
   const manager = registrySpawnTarget(installer, ["view", `${PKG}@${tag}`, "version"], resolvedOwner);
   if (!manager) return null;
-  const r = spawnSync(manager.bin, manager.args, {
+  const r = spawn(manager.bin, manager.args, {
     encoding: "utf8",
     timeout: 12000,
     windowsHide: true,
-    env: unprivilegedOwnershipMutationEnvironment(manager.env ?? process.env),
+    cwd: installer === "pnpm" ? PNPM_READ_CWD : undefined,
+    env: installer === "pnpm"
+      ? pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(manager.env ?? process.env))
+      : unprivilegedOwnershipMutationEnvironment(manager.env ?? process.env),
     ...manager.options,
   });
   return r.status === 0 && typeof r.stdout === "string" ? (r.stdout.trim() || null) : null;
@@ -340,7 +357,10 @@ export function checkUpdatePackageIntegrity(
       encoding: "utf8",
       timeout: 12000,
       windowsHide: true,
-      env: unprivilegedOwnershipMutationEnvironment(target.env ?? process.env),
+      cwd: installer === "pnpm" ? PNPM_READ_CWD : undefined,
+      env: installer === "pnpm"
+        ? pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(target.env ?? process.env))
+        : unprivilegedOwnershipMutationEnvironment(target.env ?? process.env),
       ...target.options,
     });
   });
@@ -528,7 +548,8 @@ export async function runUpdate(): Promise<void> {
   };
   const startProxyDirectly = async (): Promise<boolean> => {
     if (!postUpdateLauncherUsable || !existsSync(postUpdateLauncher)) return false;
-    const env = mutation.controlEnvironment();
+    // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+    const env = mutation.controlEnvironment(withoutSiblingMarker(process.env));
     delete env.OCX_SERVICE;
     const child = spawn(process.execPath, [postUpdateLauncher, "start", "--port", String(capturedListen.port)], {
       detached: true, stdio: "ignore", windowsHide: true, env: withProcessRuntimeProvenance(env),

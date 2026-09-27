@@ -1,5 +1,7 @@
 # Subagents And Multi-Agent Surface
 
+Subagent quota priming remains separate from automatic activation scheduling. See the [quota activation contract](providers/openai-tiers.md#public-provider-contract).
+
 Native result continuations and function-result injection follow [the mode-specific result and control contract](transports/streaming-health.md#experimental-native-function-result-injection); this surface does not infer upstream support or alter its defaults.
 Explicit Codex CLI installation observation does not attest the runtime used by a subagent or change agent selection. See the [read-only observation contract](runtime.md#explicit-codex-cli-installation-observation).
 
@@ -190,7 +192,10 @@ fixed-order tuple of every addressing field (scope, parent thread, message type,
 recipient, sender, ciphertexts) rather than a delimiter-joined string, so no field content can shift
 a boundary. One fixed-endpoint request forwards separate parts, and assignment
 replacement compares the complete original item snapshot before splicing the run. Recovery output
-is model-transcribed plaintext, not cryptographic fidelity proof, and no internal outage retry is added.
+is model-transcribed plaintext, not cryptographic fidelity proof. An opt-in `retries` bound — off
+by default and capped at two extra sends — re-issues the same admitted request only on a transient
+upstream status or a transport failure, inside the same deadline and shared flight; terminal
+statuses, invalid output, and budget exhaustion keep the bounded refusal reasons unchanged.
 Recovery recognises all four codex-rs message types (NEW_TASK, MESSAGE, FOLLOWUP_TASK,
 FINAL_ANSWER); a FINAL_ANSWER envelope may omit the Task name line, in which case the
 structured recipient is not cross-checked because the envelope names no recipient, and

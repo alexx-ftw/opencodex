@@ -1,13 +1,21 @@
 import type { Server } from "bun";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { OcxConfig } from "../../types";
 import { getConfigDir } from "../../config/paths";
 import type { DesktopPickerController } from "../desktop-picker";
+import type { ClaudeFirstPartyDesired } from "../first-party-settings";
+import { classifyInterceptClient, interceptRouteFor } from "./client-class";
 import { CLAUDE_INTERCEPT_HOSTS, isBrowserConnect, startConnectProxy, type ConnectProxyHandle } from "./connect-proxy";
 import { startClaudeInterceptListener } from "./listener";
 import { claudeInterceptCaCertPath, ensureLocalInterceptCaForStartup, issueLocalInterceptLeaf } from "./local-ca";
+import { discardPickerCaKey, ensurePickerCa, pickerCaCertPath, pickerCaFingerprints } from "./picker-ca";
 import type { PickerRouteInput } from "./picker-models";
 import { createPickerRuntime, type CreatePickerRuntimeOptions, type PickerRuntime } from "./picker-runtime";
 import type { SecurityRunner } from "./picker-trust";
+import { ensureClaudeInterceptProxyToken, readClaudeInterceptProxyToken } from "./proxy-auth";
+import { buildClaudeInterceptEnv, migrateClaudeInterceptSettings } from "./settings";
 
 /**
  * Lifecycle for the Claude intercept pair (CONNECT proxy + TLS listener).
@@ -105,12 +113,16 @@ export interface StartClaudeInterceptOptions<T> {
    */
   requestedPort?: number;
   dispatch: (req: Request, server: Server<T>) => Promise<Response>;
+  /** Live first-party intent; absent preserves router behavior. */
+  desiredClients?: () => ClaudeFirstPartyDesired;
   maxRequestBodySize?: number;
   configDir?: string;
   /** Routes for Desktop's Code-tab picker. Picker mode is wired only when this is given. */
   loadPickerRoutes?: () => Promise<PickerRouteInput>;
   /** Test seam: builds the picker runtime. */
   createPicker?: (options: CreatePickerRuntimeOptions) => PickerRuntime;
+  /** Test seam: bind real CONNECT handlers on kernel-assigned ports without probe-and-release races. */
+  startProxy?: typeof startConnectProxy;
   /** Test seams: the macOS `security` runner and platform for the picker runtime and controller. */
   pickerSecurity?: SecurityRunner;
   pickerPlatform?: NodeJS.Platform;
@@ -121,22 +133,45 @@ export interface StartClaudeInterceptOptions<T> {
  * rejecting; callers treat it as a degraded optional integration, never as a startup failure.
  */
 export async function startClaudeIntercept<T>(options: StartClaudeInterceptOptions<T>): Promise<ClaudeInterceptHandle<T> | null> {
+  // An older release may have left the picker's exportable signing key on disk. Remove it on every
+  // start, even when the intercept or the picker is off, so an upgrade with the picker disabled
+  // does not keep the key of a CA that may still be trusted. Failure here must not block startup.
+  try { discardPickerCaKey(options.configDir ?? getConfigDir()); } catch { /* retried on the next start */ }
   if (!claudeInterceptEnabled(options.config)) return null;
   const explicitPort = typeof options.config.claudeCode?.intercept?.port === "number";
   if (options.requestedPort === 0 && !explicitPort) return null;
   const configDir = options.configDir ?? getConfigDir();
   const ca = await ensureLocalInterceptCaForStartup(configDir);
+  const startProxy = options.startProxy ?? startConnectProxy;
+  const authToken = ensureClaudeInterceptProxyToken(configDir);
   const leaf = issueLocalInterceptLeaf(ca, CLAUDE_INTERCEPT_HOSTS);
+  // Refresh an env we already own (e.g. a pre-auth proxy URL left by an upgrade) before the
+  // authenticated proxy takes over the port — a plain `ocx start` after an update would
+  // otherwise 407 every CONNECT until the next `ocx ensure` or apply. Only `stale` state is
+  // rewritten, so installs that never applied first-party are untouched.
+  try {
+    const proxyPort = claudeInterceptProxyPort(options.config, options.publicPort);
+    migrateClaudeInterceptSettings(buildClaudeInterceptEnv(proxyPort, claudeInterceptCaCertPath(configDir), authToken));
+  } catch (error) {
+    // A skipped rewrite degrades to the pre-migration behaviour and ensure/apply retries it,
+    // but silence here leaves upgraded clients hitting 407 with no recorded cause.
+    console.warn(`[claude-intercept] settings migration skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const listener = startClaudeInterceptListener<T>({
     leaf,
     dispatch: options.dispatch,
+    ...(options.desiredClients ? { route: (req: Request) =>
+      interceptRouteFor(classifyInterceptClient(req.headers.get("user-agent")), options.desiredClients!()) } : {}),
     upstreamBase: options.config.claudeCode?.anthropicBaseUrl,
     ...(options.maxRequestBodySize !== undefined ? { maxRequestBodySize: options.maxRequestBodySize } : {}),
   });
   let proxy: ConnectProxyHandle;
   try {
-    proxy = await startConnectProxy(claudeInterceptProxyPort(options.config, options.publicPort), {
+    proxy = await startProxy(claudeInterceptProxyPort(options.config, options.publicPort), {
       interceptPort: listener.port!,
+      // A real apply may recreate a missing token while this listener remains live.
+      // Read current validated authority per CONNECT; absent/invalid means deny, not mint.
+      authToken: () => readClaudeInterceptProxyToken(configDir),
     });
   } catch (error) {
     await listener.stop(true);
@@ -149,7 +184,59 @@ export async function startClaudeIntercept<T>(options: StartClaudeInterceptOptio
   let pickerProxyLive = false;
   try {
     if (options.loadPickerRoutes) {
-      picker = (options.createPicker ?? createPickerRuntime)({
+      // A picker authority is process-scoped, and older releases persisted an exportable ca.key
+      // next to the published certificate. Drop that key before anything else: a cleanup failure
+      // below must never leave a signing key on disk that outlives this process.
+      discardPickerCaKey(configDir);
+      const { inspectDesktopPickerProfile } = await import("../desktop-picker-profile");
+      // The applied profile row is durable evidence of the user's picker selection. Rotation keeps
+      // it in place — row id and its recorded previous selection included — so the picker proxy
+      // can fail to bind without losing it, and the restore enable below only updates the proxy
+      // URL inside the same row rather than recreating a selection around a placeholder pivot.
+      const pickerProfileApplied = inspectDesktopPickerProfile({
+        configDir,
+        ...(options.pickerPlatform ? { platform: options.pickerPlatform } : {}),
+      }).kind === "applied";
+      const oldCaPath = pickerCaCertPath(configDir);
+      let pickerBlocked = false;
+      if (existsSync(oldCaPath)) {
+        // Rotation cleanup drops the *replaced* authority's keychain trust. A reused process
+        // authority keeps its trust — removing it would revoke picker access mid-flight and force
+        // a redundant keychain prompt. When removal of a genuinely different predecessor fails,
+        // the picker must not arm at all: the outgoing signing key would otherwise stay trusted
+        // beside the new authority, and the already-bound main intercept pair keeps serving alone.
+        // Capture the published bytes before ensurePickerCa replaces them: the untrust step below
+        // must remove trust for the *outgoing* certificate, so it needs the old file contents.
+        let publishedPem: string | undefined;
+        let publishedSha1: string | undefined;
+        try {
+          publishedPem = readFileSync(oldCaPath, "utf8");
+          publishedSha1 = pickerCaFingerprints(publishedPem).sha1;
+        } catch { /* unreadable or malformed: nothing identifiable to remove */ }
+        const nextSha1 = pickerCaFingerprints(ensurePickerCa(configDir).certPem).sha1;
+        if (publishedPem !== undefined && publishedSha1 !== undefined && publishedSha1 !== nextSha1) {
+          const { untrustPickerCa } = await import("./picker-trust");
+          try {
+            // remove-trusted-cert takes the certificate file; ca.pem now holds the replacement,
+            // so untrust from a private copy of the bytes that were actually trusted.
+            const privateDir = mkdtempSync(join(tmpdir(), "ocx-picker-untrust-"));
+            try {
+              const outgoing = join(privateDir, "ca.pem");
+              writeFileSync(outgoing, publishedPem, { mode: 0o600 });
+              const dropped = await untrustPickerCa(outgoing, publishedSha1, options.pickerSecurity, options.pickerPlatform);
+              pickerBlocked = !dropped.ok;
+            } finally {
+              rmSync(privateDir, { recursive: true, force: true });
+            }
+          } catch {
+            pickerBlocked = true;
+          }
+          if (pickerBlocked) {
+            console.warn("⚠ Claude Desktop picker disabled: the previous certificate could not be untrusted");
+          }
+        }
+      }
+      picker = pickerBlocked ? null : (options.createPicker ?? createPickerRuntime)({
         config: options.config,
         configDir,
         loadRoutes: options.loadPickerRoutes,
@@ -160,32 +247,39 @@ export async function startClaudeIntercept<T>(options: StartClaudeInterceptOptio
         ...(options.pickerSecurity ? { security: options.pickerSecurity } : {}),
         ...(options.pickerPlatform ? { platform: options.pickerPlatform } : {}),
       });
-      const runtime = picker;
-      const interceptPort = listener.port!;
-      try {
-        pickerProxy = await startConnectProxy(claudePickerProxyPort(options.config, options.publicPort), {
-          interceptPort,
-          // No host list here: the choice below depends on which client opened the tunnel.
-          interceptHosts: [],
-          selectTunnel: (host, port, request) => {
-            // Desktop hands its pinned egress proxy to the Claude Code processes it spawns, so their
-            // api.anthropic.com traffic arrives here too and gets the same intercept as on the Claude
-            // Code proxy. Those processes trust only the intercept CA, so the picker never terminates
-            // their claude.ai tunnels; only the app's own (browser) CONNECTs reach the picker.
-            if (!isBrowserConnect(request)) {
-              return port === 443 && (CLAUDE_INTERCEPT_HOSTS as readonly string[]).includes(host.toLowerCase())
-                ? { kind: "intercept", port: interceptPort }
-                : { kind: "blind" };
-            }
-            return runtime.selectTunnel(host, port);
-          },
-        });
-        pickerProxyLive = true;
-      } catch (error) {
-        // Picker mode is optional: a busy port leaves the intercept pair running without it.
-        console.warn(`⚠ Claude Desktop picker proxy could not start: ${error instanceof Error ? error.message : String(error)}`);
-        await runtime.stop();
-        picker = null;
+      if (picker) {
+        const runtime = picker;
+        const interceptPort = listener.port!;
+        try {
+          pickerProxy = await startProxy(claudePickerProxyPort(options.config, options.publicPort), {
+            interceptPort,
+            // No authToken: Desktop's egressProxyUrl cannot present proxy credentials, so this
+            // listener stays an unauthenticated loopback relay until the profile format can carry
+            // one. The intercept proxy above is the credential-bearing hop.
+            // No host list here: the choice below depends on which client opened the tunnel.
+            interceptHosts: [],
+            selectTunnel: (host, port, request) => {
+              // Desktop hands its pinned egress proxy to the Claude Code processes it spawns, so their
+              // api.anthropic.com traffic arrives here too and gets the same intercept as on the Claude
+              // Code proxy. Those processes trust only the intercept CA, so the picker never terminates
+              // their claude.ai tunnels; only the app's own (browser) CONNECTs reach the picker.
+              if (!isBrowserConnect(request)) {
+                return port === 443 && (CLAUDE_INTERCEPT_HOSTS as readonly string[]).includes(host.toLowerCase())
+                  ? { kind: "intercept", port: interceptPort }
+                  : { kind: "blind" };
+              }
+              return runtime.selectTunnel(host, port);
+            },
+          });
+          pickerProxyLive = true;
+        } catch (error) {
+          // Picker mode is optional: a busy port leaves the intercept pair running without it.
+          // The selected profile row survives, so the next startup retries the restore once the
+          // port is free again.
+          console.warn(`⚠ Claude Desktop picker proxy could not start: ${error instanceof Error ? error.message : String(error)}`);
+          await runtime.stop();
+          picker = null;
+        }
       }
       if (picker) {
         // Dynamic: the controller reaches desktop-first-party, which imports this module.
@@ -205,6 +299,15 @@ export async function startClaudeIntercept<T>(options: StartClaudeInterceptOptio
           ...(options.pickerPlatform ? { platform: options.pickerPlatform } : {}),
         });
         await picker.start();
+        // The rotated authority still needs the user's consent in the login keychain — a decline
+        // reports trust_pending, and the picker stays a blind tunnel until trust is granted. When
+        // Desktop was pinned to the picker before the restart, the regular enable flow re-trusts
+        // the new authority and rewrites the profile row in place, so a restart does not silently
+        // turn the picker off.
+        if (pickerProfileApplied && controller) {
+          void controller.enable({ persist: false, context: "server" })
+            .catch(error => console.warn(`⚠ Claude Desktop picker restore failed: ${error instanceof Error ? error.message : String(error)}`));
+        }
       }
     }
   } catch (error) {
