@@ -66,10 +66,12 @@ function ensureWorker(): Worker {
   });
   w.on("error", (err: unknown) => {
     // A crashed worker fails every pending solve and is discarded; the next solve respawns.
+    // Identity-checked: a late error from a superseded worker must not discard a
+    // replacement that a newer solve already spawned.
     const message = err instanceof Error ? err.message : String(err);
     for (const [, entry] of pending) entry.reject(new Error(`captcha worker crashed: ${message}`));
     pending.clear();
-    worker = null;
+    if (worker === w) worker = null;
   });
   w.on("exit", (code) => {
     if (worker === w) worker = null;
@@ -101,7 +103,9 @@ export function solveTraceless(opts: {
       pending.delete(id);
       // A hung guest solve poisons the shared worker chain: every later solve would
       // queue behind it and time out too. Discard the worker so the next solve
-      // respawns a fresh one instead of staying permanently broken.
+      // respawns a fresh one instead of staying permanently broken. Cleared by
+      // identity first, so a solve that started against a newer worker is untouched.
+      if (worker === w) worker = null;
       try { w.terminate(); } catch { /* already gone */ }
       reject(new Error("captcha worker solve timed out"));
     }, opts.timeoutMs + 15_000);

@@ -171,14 +171,20 @@ export function createZcodeStartPlanAdapter(provider: OcxProviderConfig): Provid
     },
 
     async fetchResponse(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> {
-      const doFetch = (headers: Record<string, string>): Promise<Response> =>
-        fetch(request.url, {
+      // Route every gateway attempt through the supplied executor so the provider-scoped
+      // fetch seam (pacing, proxy settings, dispatch-time credential validation) and the
+      // documented header deadline apply to both the initial send and the captcha replay.
+      const doFetch = (headers: Record<string, string>): Promise<Response> => {
+        const timeout = AbortSignal.timeout(ctx?.timeoutMs ?? 60_000);
+        const signal = ctx?.abortSignal ? AbortSignal.any([ctx.abortSignal, timeout]) : timeout;
+        return (ctx?.executor ?? fetch)(request.url, {
           method: request.method,
           redirect: "manual",
           headers,
           body: request.body,
-          signal: ctx?.abortSignal,
+          signal,
         });
+      };
 
       let response = await doFetch(request.headers as Record<string, string>);
       if (!response.ok) {
