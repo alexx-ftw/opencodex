@@ -135,6 +135,9 @@ const _DEBUG = /^(1|true|yes)$/i.test(
 // see it. If proxy support is ever needed, pass a per-request dispatcher at the call site.
 
 // ── Globals shared across solves ────────────────────────────────────────────
+// The worker is long-lived, so this log MUST stay bounded: the only consumer is the stall
+// detector's "last entry" read plus small tail slices, so a compact ring is enough.
+const _REQUEST_LOG_MAX = 64;
 const _requestLog = [];
 const solveTimes = [];
 // Consecutive-stall tracker per pe bundle URL: the same cached pe version
@@ -320,6 +323,7 @@ function makeInterceptor(bypassPeCache = false) {
     async beforeAsyncRequest({ request, window: w }) {
       const url = request.url;
       _requestLog.push({ at: Date.now(), method: request.method, url });
+      if (_requestLog.length > _REQUEST_LOG_MAX) _requestLog.splice(0, _requestLog.length - _REQUEST_LOG_MAX);
       injectRequestHeaders(request);
       if (/\balicdn\.com/i.test(url)) {
         let body = skipPeCache(url) ? null : getCachedBody(url);
@@ -395,6 +399,7 @@ function makeInterceptor(bypassPeCache = false) {
     beforeSyncRequest({ request, window: w }) {
       const url = request.url;
       _requestLog.push({ at: Date.now(), method: request.method, url, sync: true });
+      if (_requestLog.length > _REQUEST_LOG_MAX) _requestLog.splice(0, _requestLog.length - _REQUEST_LOG_MAX);
       injectRequestHeaders(request);
       let body = null;
       if (/\balicdn\.com/i.test(url)) {

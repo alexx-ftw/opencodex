@@ -33,20 +33,27 @@ export function isCanonicalZcodePlanBaseUrl(baseUrl: string): boolean {
  * OPENCODEX_HOME installs keep separate device identities); `ZCODE_DEVICE_MID` overrides
  * (e.g. to reuse the desktop client's id so the gateway sees one continuous device).
  */
+/** Memoized so a persistence failure does not regenerate the id on every probe: the
+ *  gateway correlates billing evidence across calls by device, so a per-probe identity
+ *  would fragment the history it uses for risk scoring. */
+let _memoDeviceMid: string | undefined;
+
 export function zcodePlanDeviceMid(): string {
+  if (_memoDeviceMid) return _memoDeviceMid;
   const fromEnv = process.env.ZCODE_DEVICE_MID?.trim();
-  if (fromEnv) return fromEnv;
+  if (fromEnv) { _memoDeviceMid = fromEnv; return fromEnv; }
   const dir = getConfigDir();
   const file = join(dir, "zcode-plan-device-mid");
   try {
     const stored = readFileSync(file, "utf8").trim();
-    if (stored) return stored;
+    if (stored) { _memoDeviceMid = stored; return stored; }
   } catch { /* first run or unreadable: generate below */ }
   const mid = randomUUID();
   try {
     mkdirSync(dir, { recursive: true });
     writeFileSync(file, mid, { mode: 0o600 });
   } catch { /* persistence is best-effort; an unpersisted id still works per-process */ }
+  _memoDeviceMid = mid;
   return mid;
 }
 

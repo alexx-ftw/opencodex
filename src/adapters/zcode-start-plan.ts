@@ -26,10 +26,12 @@
 import { createAnthropicAdapter } from "./anthropic";
 import { arch, platform } from "node:os";
 import type { AdapterFetchContext, AdapterRequest, IncomingMeta, ProviderAdapter } from "./base";
+import type { RequestExecutionBudget } from "../lib/request-execution-budget";
 import type { OcxParsedRequest, OcxProviderConfig } from "../types";
 import { solveTraceless } from "./zcode-start-plan/captcha-host";
 import { transformStartPlanBody, userIdFromJwt } from "./zcode-start-plan/body-transform";
 import { buildZcodeIdentityHeaders, buildZcodeTraceHeaders } from "./zcode-identity";
+import { readBoundedResponseBytes } from "../lib/bounded-body";
 
 /** Public config endpoint the desktop client reads its captcha scene from.
  *  The platform segment mirrors the desktop build convention (`<platform>-<arch>`). */
@@ -56,7 +58,10 @@ async function readCaptchaScene(signal?: AbortSignal): Promise<{ sceneId: string
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });
   if (!res.ok) throw new Error(`captcha config fetch failed: status ${res.status}`);
-  const body = (await res.json()) as {
+  // Bounded: the config payload is a small JSON document.
+  const rawText = await res.text();
+  if (rawText.length > 256 * 1024) throw new Error("captcha config fetch failed: oversized payload");
+  const body = JSON.parse(rawText) as {
     data?: { configs?: { captcha?: { enabled?: boolean; sceneId?: string; prefix?: string; region?: string } } };
   };
   const cfg = body.data?.configs?.captcha;
@@ -64,10 +69,18 @@ async function readCaptchaScene(signal?: AbortSignal): Promise<{ sceneId: string
   return { sceneId: cfg.sceneId, prefix: cfg.prefix, region: cfg.region ?? "sgp" };
 }
 
-async function readBodyText(response: Response): Promise<string | undefined> {
+async function readBodyText(response: Response, signal?: AbortSignal): Promise<string | undefined> {
   if (/text\/event-stream/i.test(response.headers.get("content-type") ?? "")) return undefined;
   try {
-    return await response.text();
+    // Bounded: error/challenge bodies are small JSON; a misbehaving gateway can neither
+    // stall the request indefinitely nor balloon memory past the cap.
+    const { bytes, oversized } = await readBoundedResponseBytes(response, {
+      signal,
+      maxBytes: 256 * 1024,
+      inactivityTimeoutMs: 15_000,
+    });
+    if (oversized) return undefined;
+    return new TextDecoder().decode(bytes);
   } catch {
     return undefined;
   }
@@ -117,8 +130,24 @@ export function isCaptchaChallenge(status: number, headers: Headers, bodyText: s
  */
 let solveChain: Promise<unknown> = Promise.resolve();
 
+/** Target key for the shared send-budget contract (single fixed gateway destination). */
+const GATEWAY_BUDGET_TARGET_KEY = "zcode-start-plan/messages";
+/** The captcha replay is a retry of a pre-commit transport failure class. */
+const REPLAY_BUDGET_SEND_CLASS = "transient" as const;
+
 export function createZcodeStartPlanAdapter(provider: OcxProviderConfig): ProviderAdapter {
   const inner = createAnthropicAdapter(provider);
+  // Adapter-agnostic execution state captured from IncomingMeta at build time; the module
+  // solve chain serializes captcha solves process-wide (params are single-use), while
+  // budget admission and physical-send observation stay per logical request.
+  let execution: {
+    sendBudget?: RequestExecutionBudget;
+    onPhysicalSend?: IncomingMeta["onPhysicalSend"];
+    onRecoveryWithheld?: IncomingMeta["onRecoveryWithheld"];
+    ordinal: number;
+  } | undefined;
+
+  const isChallenge = isCaptchaChallenge;
 
   const solveCaptcha = (signal?: AbortSignal): Promise<{ param: string; region: string }> => {
     const mine = solveChain.then(async () => {
@@ -129,8 +158,6 @@ export function createZcodeStartPlanAdapter(provider: OcxProviderConfig): Provid
     solveChain = mine.catch(() => undefined);
     return mine;
   };
-
-  const isChallenge = isCaptchaChallenge;
 
   return {
     ...inner,
@@ -159,6 +186,15 @@ export function createZcodeStartPlanAdapter(provider: OcxProviderConfig): Provid
       // with biz code 3012 even when auth and captcha pass. transformStartPlanBody parses
       // the body tolerantly; the model id is already on the parsed request.
       const body = transformStartPlanBody(built.body as string, parsed.modelId, userIdFromJwt(jwt.replace(/^Bearer /, "")));
+      // Capture the shared transport contract for this logical request: the captcha replay
+      // is a SECOND physical send and must observe the same budget and send accounting the
+      // entry send did (per the #4546 physical-send contract).
+      execution = {
+        sendBudget: incoming.sendBudget,
+        onPhysicalSend: incoming.onPhysicalSend,
+        onRecoveryWithheld: incoming.onRecoveryWithheld,
+        ordinal: 0,
+      };
       return {
         ...built,
         body,
@@ -174,7 +210,23 @@ export function createZcodeStartPlanAdapter(provider: OcxProviderConfig): Provid
       // Route every gateway attempt through the supplied executor so the provider-scoped
       // fetch seam (pacing, proxy settings, dispatch-time credential validation) and the
       // documented header deadline apply to both the initial send and the captcha replay.
-      const doFetch = (headers: Record<string, string>): Promise<Response> => {
+      // The replay is a second physical send: it draws against the reserve exactly as the
+      // cursor retry ladder does, and reports its ordinal through onPhysicalSend.
+      const admitSend = (recovery?: "connection-reset"): void => {
+        const ordinal = (execution?.ordinal ?? 0) + 1;
+        if (execution) execution.ordinal = ordinal;
+        const decision = execution?.sendBudget?.reserveDispatch({
+          sendClass: ordinal > 1 ? REPLAY_BUDGET_SEND_CLASS : "initial",
+          targetKey: GATEWAY_BUDGET_TARGET_KEY,
+        });
+        if (decision && !decision.allowed) {
+          throw new Error(`zcode-start-plan: send budget exhausted (${decision.reason})`);
+        }
+        execution?.onPhysicalSend?.({ ordinal, ...(recovery ? { recovery } : {}) });
+      };
+
+      const doFetch = (headers: Record<string, string>, recovery?: "connection-reset"): Promise<Response> => {
+        admitSend(recovery);
         const timeout = AbortSignal.timeout(ctx?.timeoutMs ?? 60_000);
         const signal = ctx?.abortSignal ? AbortSignal.any([ctx.abortSignal, timeout]) : timeout;
         return (ctx?.executor ?? fetch)(request.url, {
@@ -212,7 +264,7 @@ export function createZcodeStartPlanAdapter(provider: OcxProviderConfig): Provid
             ...(request.headers as Record<string, string>),
             "X-Aliyun-Captcha-Verify-Param": captcha.param,
             "X-Aliyun-Captcha-Verify-Region": captcha.region,
-          });
+          }, "connection-reset");
         } else {
           // Rebuild from the consumed text so the caller still has a readable body.
           response = new Response(bodyText ?? "", {

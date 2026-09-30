@@ -31,7 +31,7 @@ interface SolveRequest {
 
 let worker: Worker | null = null;
 let nextId = 1;
-const pending = new Map<number, { resolve: (p: string) => void; reject: (e: Error) => void }>();
+const pending = new Map<number, { owner: Worker; resolve: (p: string) => void; reject: (e: Error) => void }>();
 
 function solverModuleUrl(): string {
   return pathToFileURL(join(import.meta.dir, "captcha-solver.ts")).href;
@@ -67,17 +67,25 @@ function ensureWorker(): Worker {
   w.on("error", (err: unknown) => {
     // A crashed worker fails every pending solve and is discarded; the next solve respawns.
     // Identity-checked: a late error from a superseded worker must not discard a
-    // replacement that a newer solve already spawned.
+    // replacement that a newer solve already spawned, and must not reject solves that
+    // belong to the replacement.
     const message = err instanceof Error ? err.message : String(err);
-    for (const [, entry] of pending) entry.reject(new Error(`captcha worker crashed: ${message}`));
-    pending.clear();
+    for (const [id, entry] of pending) {
+      if (entry.owner === w) {
+        entry.reject(new Error(`captcha worker crashed: ${message}`));
+        pending.delete(id);
+      }
+    }
     if (worker === w) worker = null;
   });
   w.on("exit", (code) => {
     if (worker === w) worker = null;
     if (code !== 0) {
-      for (const [, entry] of pending) entry.reject(new Error(`captcha worker exited with code ${code}`));
-      pending.clear();
+      for (const [id, entry] of pending) {
+        if (entry.owner !== w) continue;
+        entry.reject(new Error(`captcha worker exited with code ${code}`));
+        pending.delete(id);
+      }
     }
   });
   worker = w;
@@ -111,6 +119,7 @@ export function solveTraceless(opts: {
     }, opts.timeoutMs + 15_000);
     if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
     pending.set(id, {
+      owner: w,
       resolve: (param) => {
         clearTimeout(timer);
         resolve(param);

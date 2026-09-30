@@ -789,6 +789,9 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
       "GLM-5.2": ["text"],
       "GLM-5-Turbo": ["text"],
     },
+    // Without an explicit cap the inner Anthropic adapter's default (32k) truncates long
+    // responses and tool arguments on this gateway.
+    defaultMaxOutputTokens: 131_072,
   },
   {
     id: "umans",
