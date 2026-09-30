@@ -578,8 +578,11 @@ export default function Logs({ apiBase }: { apiBase: string }) {
     };
   }, [apiBase]);
   // Opaque log labels → human attribution (email masked per proxy privacy settings).
-  // Fetched once per page: labels are stable for the lifetime of an account.
+  // Refetched when the log data refreshes: a dashboard pairing that completes after the
+  // page mounts turns the earlier 401 into data, so the labels must retry with it — not
+  // only on mount. `logsState` is the log poll's own reactivity driver.
   const [accountLabels, setAccountLabels] = useState<Map<string, string>>(new Map());
+  const [labelsRetryToken, setLabelsRetryToken] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
@@ -604,7 +607,13 @@ export default function Logs({ apiBase }: { apiBase: string }) {
       cancelled = true;
       controller.abort();
     };
-  }, [apiBase]);
+  }, [apiBase, labelsRetryToken]);
+  // Kick one labels refetch whenever a log poll cycle completes without them being loaded.
+  useEffect(() => {
+    if (accountLabels.size > 0) return;
+    const timer = setTimeout(() => setLabelsRetryToken(t => t + 1), 4000);
+    return () => clearTimeout(timer);
+  }, [accountLabels, apiBase]);
   // The hash is the source of truth for the active tab (#logs vs #logs/debug),
   // so refresh/bookmark/back-forward keep the tab choice.
   const [tab, setTab] = useState<LogsTab>(readTabFromHash);
