@@ -65,6 +65,10 @@ account before the request is forwarded upstream. The rule is intentionally spli
   This is separate from reset-window routing: routing chooses an account for incoming work, while
   activation sends one request to a specific opted-in account only after its own reset is due.
 
+Claude has its own separate, default-off [per-account five-hour window activation](/guides/claude-code/#automatic-five-hour-window-activation).
+It does not require account pooling, does not activate weekly windows, and consumes the selected
+Claude subscription's usage. The Codex controls and retry schedule above do not configure it.
+
 **Quota-query pacing:** Main-account hard-lock recovery waits for the known blocking reset,
 then queries to confirm recovery; time alone never unlocks the account. Without a future reset,
 background recovery uses capped 5/10/20/40/60-minute backoff while the account remains blocked. In Pool mode, ordinary main/pool usage queries

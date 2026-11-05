@@ -180,6 +180,7 @@ export interface StartServerDeps {
   packageTreeRetargetOptions?: PackageTreeRetargetOptions;
   /** Test-only seam for observing quota-worker registration ownership. */
   registerCodexQuotaAutoRefreshWorker?: typeof registerCodexQuotaAutoRefreshWorker;
+  registerAnthropicQuotaWarmupWorker?: typeof import("../../oauth/anthropic-quota-warmup").registerAnthropicQuotaWarmupWorker;
 }
 
 export function inspectStartupOwnership(

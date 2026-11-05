@@ -272,6 +272,10 @@ test("UX-05: late Pool 2 settings and reset reads never render in the primary po
     const pool = request.provider ?? "anthropic";
     const response = request.path === "/api/pool/settings"
       ? Response.json(poolSettings(pool, pool === "anthropic2", pool === "anthropic2" ? 55 : 40))
+      : request.path === "/api/oauth/accounts/warmup"
+      ? Response.json({ provider: pool, model: "claude-haiku-4-5", accounts: accounts(pool).map(account => ({
+        id: account.id, enabled: pool === "anthropic2", available: true, reason: pool === "anthropic2" ? "waiting" : "off",
+      })) })
       : Response.json(grantSnapshot(pool, pool === "anthropic2" ? 3 : 1));
     if (pool !== "anthropic2") return response;
     return new Promise<Response>(resolve => { held.push(() => resolve(response)); });
@@ -279,7 +283,7 @@ test("UX-05: late Pool 2 settings and reset reads never render in the primary po
   await render(<ProviderAuthPanel item={POOL_B} apiBase="" accounts={accounts("anthropic2")} authHandlers={recordingHandlers(calls)} />);
   await tick();
   await tick();
-  expect(held).toHaveLength(3);
+  expect(held).toHaveLength(4); // Pool settings, two reset-grant reads, and local warm-up status.
 
   await render(<ProviderAuthPanel item={POOL_A} apiBase="" accounts={accounts("anthropic")} authHandlers={recordingHandlers(calls)} />);
   await tick();
@@ -287,6 +291,8 @@ test("UX-05: late Pool 2 settings and reset reads never render in the primary po
   // A stalled Pool 2 read does not occupy the primary pool's read slots.
   expect(grantBadges()).toEqual(["1", "1"]);
   expect(poolToggle()?.getAttribute("aria-pressed")).toBe("false");
+  const warmupButtons = () => [...host.querySelectorAll<HTMLButtonElement>(`section[aria-label="${en["anthropicWarmup.title"]}"] button.toggle`)];
+  expect(warmupButtons().map(button => button.getAttribute("aria-pressed"))).toEqual(["false", "false"]);
 
   await act(async () => { held.forEach(release => release()); });
   await tick();
@@ -294,6 +300,7 @@ test("UX-05: late Pool 2 settings and reset reads never render in the primary po
   expect(grantBadges()).toEqual(["1", "1"]);
   expect(poolToggle()?.getAttribute("aria-pressed")).toBe("false");
   expect(calls).toEqual([["poolThreshold", "anthropic", 40]]);
+  expect(warmupButtons().map(button => button.getAttribute("aria-pressed"))).toEqual(["false", "false"]);
 });
 
 test("UX-05: an unmarked custom anthropic2 row receives neither pool's settings nor reset reads", async () => {

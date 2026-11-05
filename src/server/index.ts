@@ -49,7 +49,7 @@ import {
   registerCodexCooldownRecoveryProbeWorker,
 } from "../codex/auth-api";
 import { activateResetCreditAutoRedeem } from "../codex/reset-credit-auto-redeem";
-import { registerCodexQuotaAutoRefreshWorker } from "../codex/quota-auto-refresh";
+import { registerQuotaWarmupWorkers } from "./index/quota-warmup-workers";
 import {
   reconcileLiveStateStores,
   setLiveStateStoreConfig,
@@ -634,8 +634,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   };
   try {
     backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy, config);
-    unregisterQuotaAutoRefresh = (deps.registerCodexQuotaAutoRefreshWorker
-      ?? registerCodexQuotaAutoRefreshWorker)(config);
+    unregisterQuotaAutoRefresh = registerQuotaWarmupWorkers(config, deps);
     // Poll external pricing edits; the startup catch releases this owner-scoped lease.
     userCostOverlayReconciler = startUserCostOverlayReconciler({ liveConfig: config });
     const serveOptions = createServeOptions({

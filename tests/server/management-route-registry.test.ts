@@ -312,6 +312,17 @@ describe("management route registry reconciliation", () => {
       .toMatchObject({ module: "server/management/oauth-account-routes", mutates: false, exempt: { reason: "session-only" } });
   });
 
+  test("Claude warm-up declares a local read and a consent-gated write", () => {
+    const routes = MANAGEMENT_ROUTES.filter(route => route.path === "/api/oauth/accounts/warmup");
+    expect(routes).toHaveLength(2);
+    expect(routes.find(route => route.method === "GET")).toMatchObject({
+      module: "server/management/anthropic-quota-warmup-routes", mutates: false, mechanism: "path-constant", exempt: { reason: "gui-only" },
+    });
+    expect(routes.find(route => route.method === "PUT")).toMatchObject({
+      module: "server/management/anthropic-quota-warmup-routes", mutates: true, mechanism: "path-constant", exempt: { reason: "session-only" },
+    });
+  });
+
   test("the constant-backed Hermes profile list is explicitly declared", () => {
     expect(MANAGEMENT_ROUTES.find(route =>
       route.method === "GET" && route.path === "/api/client-integrations/hermes/profiles"))

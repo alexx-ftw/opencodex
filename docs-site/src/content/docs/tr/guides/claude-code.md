@@ -28,9 +28,10 @@ olarak kapalıdır** ve deneyseldir.
 Pano, havuzun hangi koşullar için tasarlandığını gösterir: size ait olan veya kullanma yetkiniz bulunan
 abonelikler, gerçek Claude Code istemcisi ve oturumu gözeten bir kişi. Anthropic otomatik hesap havuzunu
 onaylamamıştır; aynı kuruluştaki hesaplar kotayı paylaşabilir (yeni hesap kapasite eklemeyebilir) ve hesap
-değiştirmek sağlayıcı yaptırımlarına karşı koruma sağlamaz. OpenCodex hesapları sıcak tutmak için (keep-warm)
-istek göndermez ve varsayılan olarak Claude jetonlarını arka planda yenilemez ya da kullanımı arka planda
-okumaz: kullanım, pano, menü çubuğu uygulaması veya bir `ocx` komutu istediğinde okunur. Eşikler hesap
+değiştirmek sağlayıcı yaptırımlarına karşı koruma sağlamaz. OpenCodex varsayılan olarak hesapları sıcak tutmak
+için (keep-warm) istek göndermez, Claude jetonlarını arka planda yenilemez ve kullanımı arka planda
+okumaz: kullanım, pano, menü çubuğu uygulaması veya bir `ocx` komutu istediğinde okunur. Aşağıdaki isteğe
+bağlı beş saatlik pencere etkinleştirme özelliği yalnızca seçilen hesaplar için istisnadır. Eşikler hesap
 seçimi için tercihtir; kullanım veya faturalandırma sınırı değildir. Bu bir ürün açıklamasıdır, hukuki
 tavsiye değildir; Anthropic'in güncel koşullarını kontrol edin.
 
@@ -49,6 +50,23 @@ Etkinleştirildiğinde operasyonel sözleşme:
 
 Bkz.
 [Yapılandırma](/tr/reference/configuration/providers/#anthropicaccountpool-deneysel).
+
+## Beş saatlik pencereyi otomatik etkinleştirme
+
+**Providers → Anthropic** veya **Anthropic Pool 2** altında, varsayılan olarak kapalı olan
+ayrı bir ayar seçilen hesaptan küçük bir mesaj gönderilmesini sağlar. Gönderim, sağlayıcının
+bildirdiği beş saatlik pencerenin sıfırlanma zamanını bekler; kurulumdan itibaren körlemesine
+her beş saatte bir çalışmaz. Tek hesapla ve havuz kapalıyken de kullanılabilir. Sonlu bir
+beş saatlik pencere önceden bilinmeli ve proxy çalışıyor olmalıdır. Yeni hesaplar veya
+değiştirilen oturum açma bilgileri otomatik olarak etkinleştirilmez.
+
+Mesaj, haftalık kota dahil abonelik kullanımını tüketir; limitleri artırmaz veya kısıtlamaları
+aşmaz. Duraklatılmış, yeniden oturum açılması gereken, bekleme süresinde olan ya da bilinen
+haftalık kotası tükenmiş hesaplar gönderim yapmaz. Başka hesaba geçiş yapılmaz. Etkinleştirme
+yalnızca yeni bir beş saatlik sıfırlanma zamanı gözlendiğinde doğrulanır; başarılı yanıt tek
+başına yeterli değildir. Açmak için panoda açık onay gerekir. Kapatmak gelecekteki denemeleri
+durdurur, gönderilmiş mesajı geri alamaz. Anthropic'in güncel koşullarını ve
+[İngilizce ayrıntıları](/guides/claude-code/#automatic-five-hour-window-activation) inceleyin.
 
 ## Hızlı Başlangıç
 

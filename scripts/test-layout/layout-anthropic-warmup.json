@@ -1,0 +1,8 @@
+{
+  "oauth-anthropic-quota-warmup-settings.test.ts": "oauth",
+  "oauth-anthropic-quota-warmup-worker.test.ts": "oauth",
+  "oauth-anthropic-quota-warmup-send.test.ts": "oauth",
+  "management-anthropic-quota-warmup.test.ts": "server",
+  "management-provider-anthropic-warmup-ownership.test.ts": "server",
+  "quota-warmup-workers.test.ts": "server"
+}

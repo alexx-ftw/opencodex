@@ -164,6 +164,8 @@ export const MANAGEMENT_ROUTES: readonly ManagementRoute[] = [
   { method: "POST", path: "/api/grok/reset-coupons/consume", module: "server/management/grok-coupon-routes", mutates: true },
   { method: "GET", path: "/api/anthropic/reset-grants", module: "server/management/anthropic-reset-grant-routes", mutates: false },
   { method: "POST", path: "/api/anthropic/reset-grants/consume", module: "server/management/anthropic-reset-grant-routes", mutates: true, exempt: { reason: "session-only", why: "Spending a Claude reset grant requires the gui-session principal (anthropic-reset-grant-routes.ts handleConsume); the admin token is refused." } },
+  { method: "GET", path: "/api/oauth/accounts/warmup", module: "server/management/anthropic-quota-warmup-routes", mutates: false, mechanism: "path-constant", exempt: { reason: "gui-only", why: "Local status for the dashboard's per-account consent controls; this read never sends inference or refreshes credentials." } },
+  { method: "PUT", path: "/api/oauth/accounts/warmup", module: "server/management/anthropic-quota-warmup-routes", mutates: true, mechanism: "path-constant", exempt: { reason: "session-only", why: "Enabling future subscription requests requires human dashboard consent. Authenticated administrators may only disable it." } },
   { method: "PUT", path: "/api/claude-code", module: "server/management/agent-settings-routes", mutates: true },
   { method: "PUT", path: "/api/claude-desktop", module: "server/management/agent-settings-routes", mutates: true },
   { method: "PUT", path: "/api/claude-desktop/first-party-bindings", module: "server/management/agent-settings-routes", mutates: true },

@@ -16,6 +16,19 @@ export interface AnthropicModelRoute {
   fallback?: boolean;
 }
 
+/** Explicit human opt-in, bound to one login. All timestamps are Unix milliseconds. */
+export interface AnthropicQuotaAutoRefreshAccountSettings {
+  enabled: boolean;
+  /** Private consent binding: a fresh login must be opted in again. */
+  loginId: string;
+  nextFiveHourResetAt?: number;
+  /** Durable send intent, claimed before dispatch to avoid duplicate background use. */
+  lastAttemptedResetAt?: number;
+  lastAttemptAt?: number;
+  /** A reset is confirmed only by a successful response with new quota evidence. */
+  lastConfirmedResetAt?: number;
+}
+
 export interface AnthropicAccountPoolConfig {
   enabled?: boolean;
   /** Preserve native Claude Messages while the pool is enabled. Default true; false selects legacy translation. */
@@ -30,4 +43,6 @@ export interface AnthropicAccountPoolConfig {
   quotaWindow?: OcxAccountPoolQuotaWindow;
   /** Ordered model allowlists; inactive while the pool is disabled. Stored account IDs only. */
   routes?: AnthropicModelRoute[];
+  /** Default off. Exact-account five-hour window warmup; never inherited across instances. */
+  quotaAutoRefresh?: Record<string, AnthropicQuotaAutoRefreshAccountSettings>;
 }

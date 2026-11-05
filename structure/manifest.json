@@ -742,6 +742,26 @@
       ]
     },
     {
+      "path": "providers/anthropic-quota-warmup.md",
+      "tier": 4,
+      "title": "Anthropic Automatic Five-Hour Window Activation",
+      "scope": "Per-account Claude opt-in, known-reset scheduling, exact-account requests, confirmation and dashboard consent.",
+      "documents": [
+        "src/types/anthropic-account-pool.ts",
+        "src/config/schema/anthropic-account-pool.ts",
+        "src/oauth/anthropic-quota-warmup.ts",
+        "src/oauth/anthropic-quota-warmup-settings.ts",
+        "src/oauth/anthropic-quota-warmup-worker.ts",
+        "src/oauth/anthropic-quota-warmup-send.ts",
+        "src/server/index/quota-warmup-workers.ts",
+        "src/server/management/anthropic-quota-warmup-routes.ts",
+        "src/server/management/provider-anthropic-warmup-ownership.ts",
+        "gui/src/components/provider-workspace/ProviderAuthPanel.tsx",
+        "gui/src/components/provider-workspace/AnthropicQuotaWarmupSettings.tsx",
+        "gui/src/anthropic-quota-warmup-api.ts"
+      ]
+    },
+    {
       "path": "providers/oauth-code-display-login.md",
       "tier": 4,
       "title": "OAuth Code-Display Login",

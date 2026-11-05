@@ -140,6 +140,7 @@ import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, C
 import type { ManagementContext } from "./context";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 import { anthropicInstancePublicationError, mergeProviderEditorRow, preserveAnthropicInstanceMarker } from "./provider-instance-ownership";
+import { preserveAnthropicWarmupOwnership, preservePersistedAnthropicWarmupOwnership } from "./provider-anthropic-warmup-ownership";
 import { providerTlsProfileDiagnostic } from "../../lib/provider-tls-profile";
 
 type ProviderPatchApplication =
@@ -253,6 +254,8 @@ function providerEditorCandidate(
     const namespaceCollision = codexAccountNamespaceProviderCollisionError(candidate.codexAccountNamespaces, name);
     if (namespaceCollision) return { ok: false, status: 409, error: namespaceCollision, code: "provider_namespace_conflict" };
     const merged = mergeProviderEditorRow(persisted.providers[name], baseline.providers[name], publicProvider);
+    const warmupError = preserveAnthropicWarmupOwnership(name, merged, publicProvider, persisted.providers[name]);
+    if (warmupError) return { ok: false, status: 400, error: warmupError, code: "warmup_requires_dedicated_route" };
     const markerCollision = anthropicInstancePublicationError(name, merged, persisted.providers[name]);
     if (markerCollision) return { ok: false, status: 409, error: markerCollision, code: "anthropic_instance_collision" };
     const transportCandidate = providerTransportValidationCandidate(merged as unknown as Record<string, unknown>);
@@ -1146,6 +1149,8 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const aliasOwnershipError = providerAliasOverlayOwnershipError(body.provider, existing);
     if (aliasOwnershipError) return jsonResponse({ error: aliasOwnershipError }, 400);
     const transportCandidate = providerTransportValidationCandidate(body.provider);
+    const warmupError = preserveAnthropicWarmupOwnership(name, transportCandidate as unknown as OcxProviderConfig, body.provider, existing);
+    if (warmupError) return jsonResponse({ error: warmupError }, 400);
     preserveAnthropicInstanceMarker(name, transportCandidate as unknown as OcxProviderConfig, existing);
     const markerCollision = anthropicInstancePublicationError(name, transportCandidate as unknown as OcxProviderConfig, existing);
     if (markerCollision) return jsonResponse({ error: markerCollision }, 409);
@@ -1351,7 +1356,8 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const rollback = pinsOwned ? captureConfigTopLevelRollback(config, ["defaultProvider", "modelDiscovery", "disabledModels"]) : undefined;
     let validationError: string | undefined, removedCredentials: string[] = [];
     withConfigMutationLockSync(() => {
-      validationError = anthropicInstancePublicationError(name, candidate, config.providers[name]);
+      validationError = preservePersistedAnthropicWarmupOwnership(name, candidate, rawProvider, config.providers[name])
+        ?? anthropicInstancePublicationError(name, candidate, config.providers[name]);
       if (validationError) return;
       const liveTiers = config.providers[name]?.modelContextTiers;
       if (submittedModelContextTiers && liveTiers) candidate.modelContextTiers = Object.assign(Object.create(null), liveTiers, candidate.modelContextTiers ?? {});

@@ -3,9 +3,22 @@ import { parseAnthropicModelRoutes } from "../../oauth/anthropic-model-routes";
 import { isAnthropicInstanceId } from "../../providers/anthropic-instance-id";
 import { redactSecretString } from "../../lib/redact";
 
+const warmupTimestamp = z.number().int().positive().max(8_640_000_000_000_000);
+const warmupAccountSettings = z.object({
+  enabled: z.boolean(),
+  loginId: z.string().uuid(),
+  nextFiveHourResetAt: warmupTimestamp.optional(),
+  lastAttemptedResetAt: warmupTimestamp.optional(),
+  lastAttemptAt: warmupTimestamp.optional(),
+  lastConfirmedResetAt: warmupTimestamp.optional(),
+}).strict();
+const quotaAutoRefreshSchema = z.record(z.string().min(1).max(256), warmupAccountSettings);
+
 /** Historical A load contract, shared verbatim with B: recover only the native preference. */
 export const anthropicAccountPoolSchema = z.object({
   nativeMessages: z.boolean().optional().catch(false),
+  // A malformed automation setting must never enable background account usage on load.
+  quotaAutoRefresh: quotaAutoRefreshSchema.optional().catch(undefined),
 }).passthrough().optional().catch(undefined);
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -24,6 +37,9 @@ function poolError(value: unknown, path: string): string | undefined {
   if (pool.routes !== undefined) {
     const parsed = parseAnthropicModelRoutes(pool.routes);
     if (!parsed.ok) return `schema_invalid: ${path}.routes: ${parsed.error}`;
+  }
+  if (pool.quotaAutoRefresh !== undefined && !quotaAutoRefreshSchema.safeParse(pool.quotaAutoRefresh).success) {
+    return `schema_invalid: ${path}.quotaAutoRefresh: must map account IDs to valid login-bound warmup settings`;
   }
   return undefined;
 }

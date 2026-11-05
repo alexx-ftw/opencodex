@@ -18,6 +18,9 @@ not a cryptographic or OS boundary.
 primary pool's settings. Malformed native preference remains false on tolerant load;
 strict write diagnostics reject unsupported field locations.
 
+Per-account [automatic five-hour window activation](anthropic-quota-warmup.md) is a
+separate, default-off opt-in. It is not enabled by account pooling or account login.
+
 `src/oauth/anthropic-oauth-definitions.ts` shares the OAuth engine while Pool 2
 disables local Claude CLI import and continuity. `src/oauth/store-anthropic-instance.ts`
 checks cross-instance token fingerprints and bearer-bound UUID proofs inside the

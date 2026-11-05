@@ -26,9 +26,10 @@ Le tableau de bord indique les conditions prévues : des abonnements qui vous ap
 autorisé à utiliser, le client Claude Code officiel et une personne qui supervise la session. Anthropic n'a pas
 approuvé le regroupement automatique de comptes, des comptes d'une même organisation peuvent partager un quota
 (un compte de plus n'ajoute alors pas forcément de capacité), et changer de compte ne protège pas contre
-l'application des règles du fournisseur. OpenCodex n'envoie aucune requête de maintien à chaud (keep-warm) et,
-par défaut, ne rafraîchit pas les jetons Claude et ne lit pas l'usage en arrière-plan : l'usage est lu quand le
-tableau de bord, l'app de la barre des menus ou une commande `ocx` le demande. Les seuils sont des préférences
+l'application des règles du fournisseur. Par défaut, OpenCodex n'envoie aucune requête de maintien à chaud
+(keep-warm), ne rafraîchit pas les jetons Claude et ne lit pas l'usage en arrière-plan : l'usage est lu quand le
+tableau de bord, l'app de la barre des menus ou une commande `ocx` le demande. L'activation automatique
+des fenêtres de cinq heures, décrite ci-dessous, fait exception uniquement pour les comptes choisis. Les seuils sont des préférences
 de sélection, pas des plafonds d'usage ou de facturation. Ces indications ne constituent pas un avis juridique ;
 consultez les conditions actuelles d'Anthropic.
 
@@ -45,6 +46,24 @@ Comportement lorsque cette option est activée :
   `round-robin` ignore `quotaWindow`.
 
 Voir [Configuration](/fr/reference/configuration/providers/#anthropicaccountpool-expérimental).
+
+## Activation automatique des fenêtres de cinq heures
+
+Dans **Providers → Anthropic** ou **Anthropic Pool 2**, un réglage séparé, désactivé par défaut,
+permet d'envoyer un petit message avec le compte choisi après son heure de réinitialisation
+de cinq heures annoncée par le fournisseur. Un seul compte suffit, même sans regroupement.
+Le proxy doit rester en marche et une fenêtre finie doit déjà être connue ; il ne s'agit pas
+d'un envoi aveugle toutes les cinq heures. Les nouveaux comptes et les connexions remplacées
+ne sont pas activés automatiquement.
+
+Ce message consomme le quota de l'abonnement, y compris le quota hebdomadaire : il n'ajoute
+pas de capacité et ne contourne aucune restriction. Un compte suspendu, à reconnecter, en
+délai d'attente ou dont le quota hebdomadaire connu est épuisé n'envoie rien. Le système ne
+bascule pas vers un autre compte. Il ne confirme l'activation qu'après avoir observé une
+nouvelle échéance de cinq heures ; une réponse réussie ne suffit pas. L'activation exige
+votre consentement dans le tableau de bord. La désactivation arrête les tentatives futures,
+sans annuler un message déjà envoyé. Consultez les conditions actuelles d'Anthropic et
+les [détails de référence en anglais](/guides/claude-code/#automatic-five-hour-window-activation).
 
 ## Démarrage rapide
 

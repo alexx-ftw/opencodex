@@ -22,6 +22,7 @@ import {
 } from "../../oauth-health-display";
 import CodexAccountPool from "../CodexAccountPool";
 import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
+import AnthropicQuotaWarmupSettings from "./AnthropicQuotaWarmupSettings";
 import { LoginHint as LoginHintView } from "../login-url-block";
 import { OpenBrowserPrefToggle } from "../open-browser-pref-toggle";
 import ProviderAccountQuota from "./ProviderAccountQuota";
@@ -447,6 +448,14 @@ export default function ProviderAuthPanel({
                 provider={isAnthropicInstanceId(item.name) ? item.name : "anthropic"}
                 accountCount={accounts.length}
                 onThresholdChange={threshold => { void authHandlers?.onAccountPoolThreshold?.(item.name, threshold); }}
+              />
+            )}
+            {isAnthropicPool && (
+              <AnthropicQuotaWarmupSettings
+                key={`warmup:${apiBase}:${item.name}`}
+                apiBase={apiBase}
+                provider={isAnthropicInstanceId(item.name) ? item.name : "anthropic"}
+                accounts={accounts}
               />
             )}
             {item.name === "google-antigravity" && (

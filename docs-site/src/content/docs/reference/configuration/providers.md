@@ -1066,6 +1066,20 @@ for the subscription and client conditions the pool is meant for.
 | `anthropicAccountPool.stickyLimit?` | `number` | `1` | Successful new-session binds retained on one round-robin selection. Range 1–100. |
 | `anthropicAccountPool.routes?` | `{name, match, accounts, fallback?}[]` | — | Ordered model routes for the enabled Anthropic OAuth pool. `match` is a full, case-sensitive model ID glob (`*` and `?`); first match wins. `accounts` contains stored account IDs, not aliases. Eligible accounts are limited to the route for initial selection and 429 retry. Without fallback, an empty route returns a local 401, or 429 with route-scoped `Retry-After` if all its declared accounts are cooling. With `fallback: true`, an all-cooling ordinary pool returns 429 with its earliest usable cooldown, even if a saved route account was removed; the client response never names the route; the proxy log uses `route:#<n>` for the rule’s 1-based position. `fallback: true` widens only when no routed account is eligible; fill-first then uses ordinary pool order. No matching rule retains normal selection; disabling the pool makes saved routes inactive. Invalid rules fail validated writes and prevent routed dispatch until corrected. `null` clears routes through the settings API. |
 
+The separate `anthropicAccountPool.quotaAutoRefresh` map stores per-account opt-ins for
+[automatic five-hour window activation](/guides/claude-code/#automatic-five-hour-window-activation).
+It is absent/off by default and independent of `anthropicAccountPool.enabled`; a single account
+can opt in without a pool. Use the dedicated dashboard control to bind consent to the current
+login and a confirmed finite five-hour window. Its saved schedule is not a weekly reset or a
+usage cap. Requests consume subscription quota. Newly added or replacement logins are not
+automatically enabled. For Pool 2 the map lives under
+`providers.anthropic2.anthropicAccountPool.quotaAutoRefresh`, with no inheritance from the primary
+pool. Each entry is `{ enabled, loginId, nextFiveHourResetAt?, lastAttemptedResetAt?, lastAttemptAt?, lastConfirmedResetAt? }`.
+`enabled` is a boolean, `loginId` binds consent to that login, and timestamps are Unix milliseconds.
+The schedule and attempt fields are maintained by OpenCodex; disabling and re-enabling the same
+login preserves its attempt history. Generic provider edits cannot create or change this owned
+map; omission preserves it and an unchanged round trip is allowed.
+
 Anthropic OAuth vision and web-search helpers match these routes using each helper's own model,
 independently of the main request model. Each helper authenticates with its routed account, which
 can differ from the globally active account. If a strict helper route has no eligible account, the

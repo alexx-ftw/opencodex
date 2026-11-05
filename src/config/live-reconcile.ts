@@ -1,5 +1,6 @@
 import { observeAccountAutoPauseRevisions, snapshotAutoPauseFingerprints } from "./account-auto-pause-revisions";
-import type { OcxConfig, OcxProviderConfig, ProviderCostOverlay } from "../types";
+import type { OcxConfig, OcxProviderConfig, ProviderCostOverlay, AnthropicQuotaAutoRefreshAccountSettings, AnthropicInstanceId } from "../types";
+import { anthropicInstanceRowShapeMatches } from "../providers/anthropic-instance-id";
 import { configReasoningPinsConfigError } from "./provider-validation";
 import { adoptCustomModelCatalogMigration, projectCustomModelCatalogMigration } from "../codex/custom-model-catalog-migration";
 import { refreshPreservedProviderOwner } from "../usage/user-cost-overlays";
@@ -117,6 +118,41 @@ export function adoptPersistedAdvisor(config: OcxConfig, persisted: OcxConfig["a
   if (baseline) baseline.advisor = structuredClone(persisted);
   clearConfigTopLevelDeletionIntent(config, ["advisor"]);
   if (baseline) clearConfigTopLevelDeletionIntent(baseline, ["advisor"]);
+}
+
+/**
+ * Adopt only one committed warmup account and its merge baseline. Without this,
+ * an unrelated whole-config save mistakes a persisted opt-in/claim for pending
+ * live intent and can undo a later external opt-out. Other accounts, pool knobs
+ * and provider fields retain their existing live values and baselines.
+ */
+export function adoptPersistedAnthropicQuotaWarmupAccount(
+  config: OcxConfig, instance: AnthropicInstanceId, accountId: string,
+  persisted: AnthropicQuotaAutoRefreshAccountSettings | undefined,
+): void {
+  if (instance === "anthropic2" && (!config.providers.anthropic2
+    || !anthropicInstanceRowShapeMatches(instance, config.providers.anthropic2))) {
+    throw new Error("Anthropic warmup provider is no longer configured");
+  }
+  const adopt = (target: OcxConfig): void => {
+    const pool = instance === "anthropic" ? target.anthropicAccountPool : target.providers.anthropic2?.anthropicAccountPool;
+    const entries = { ...pool?.quotaAutoRefresh };
+    if (persisted === undefined) delete entries[accountId];
+    else Object.defineProperty(entries, accountId, {
+      value: structuredClone(persisted), enumerable: true, configurable: true, writable: true,
+    });
+    const next = { ...pool, quotaAutoRefresh: entries };
+    if (instance === "anthropic") target.anthropicAccountPool = next;
+    else {
+      // An instance added since arming needs only a structural baseline ancestor,
+      // not a copy of unrelated provider fields that may still be pending edits.
+      const provider = target.providers.anthropic2 ?? {} as OcxProviderConfig;
+      target.providers.anthropic2 = { ...provider, anthropicAccountPool: next };
+    }
+  };
+  adopt(config);
+  const baseline = liveConfigBaseline.get(config);
+  if (baseline) adopt(baseline);
 }
 /**
  * The live config retains the address of the socket Bun actually opened, while

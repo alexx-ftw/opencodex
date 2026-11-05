@@ -27,7 +27,7 @@ merges PATCH entries, and preserves omitted entries on full provider saves. POST
 the live tier map after destination validation under the config mutation lock, so a concurrent
 PATCH clear is not restored. The CLI uses that API for GitHub Copilot tier edits. The dashboard has no tier control yet. `src/server/auth-cors.ts` classifies `projectResponsesLiteHostedSearchHistory` as an editor-visible provider field and validates supplied values as strict booleans. Its canonical `openai` seed comparison treats this validated, default-off request-content setting as an operator overlay; it does not change canonical authentication or transport identity. The setting still obeys the exact-destination and explicit-Lite [hosted-search history boundary](providers-and-adapters.md#hosted-search-continuation-binding).
 
-Automatic activation retains its existing settings controls; dashboard quota queries remain independent. See the [quota activation contract](providers/openai-tiers.md#public-provider-contract).
+Codex automatic activation retains its existing settings controls; dashboard quota queries remain independent. See the [quota activation contract](providers/openai-tiers.md#public-provider-contract). Claude has a separate per-account control and human-session-gated enable write; its read-only status, disable and persistence behavior follow [automatic five-hour window activation](providers/anthropic-quota-warmup.md).
 
 The companion settings contract in `src/companion/` persists menu-bar and widget preferences.
 `src/server/management/companion-routes.ts` exposes them and the usage timeline from

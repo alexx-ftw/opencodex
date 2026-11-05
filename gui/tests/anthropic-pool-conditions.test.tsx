@@ -368,16 +368,17 @@ describe("every locale carries the same pool claims", () => {
         expect(dict[key], code + " " + key).not.toBe(key);
       }
       // Tokens every language writes the same way: the client, the vendor, the status code,
-      // the default threshold, the keep-warm term, and the CLI name.
+      // and the default threshold. Activity now localizes the separate warm-up opt-in.
       expect(dict["anthropicPool.experimentalWarning"], code).toContain("Claude Code");
       expect(dict["anthropicPool.experimentalWarning"], code).toContain("Anthropic");
       expect(dict["anthropicPool.disabledDesc"], code).toContain("429");
       expect(dict["anthropicPool.detailsFailover"], code).toContain("429");
       expect(dict["anthropicPool.thresholdHelp"], code).toContain("80");
-      expect(dict["anthropicPool.detailsActivity"], code).toMatch(/keep-warm/i);
-      expect(dict["anthropicPool.detailsActivity"], code).toContain("ocx");
       expect(dict["anthropicPool.experimentalWarning"], code).not.toMatch(/battle/i);
     }
+    expect(DICTS.en["anthropicPool.detailsActivity"]).toContain("The pool itself sends no keep-warm requests");
+    expect(DICTS.en["anthropicPool.detailsActivity"]).toContain("a separate, per-account opt-in");
+    expect(DICTS.en["anthropicPool.detailsActivity"]).toContain("may send a minimal request after a confirmed reset");
   });
 
   test("Korean reads as Korean product copy", () => {

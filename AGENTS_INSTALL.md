@@ -145,6 +145,26 @@ read usage without validating pending accounts. Relay the dashboard recovery
 instruction to the user; do not mint a GUI session or call the provider directly
 to work around this boundary. This also applies when operating a headless host.
 
+### Automatic Claude five-hour window activation
+
+Automatic activation sends real, small model requests using selected Claude OAuth
+accounts. It consumes subscription usage, including weekly usage; it neither raises
+limits nor grants an exemption from Anthropic's policies. It is off by default,
+separate from account pooling, and requires a known finite five-hour window.
+
+Only the user's explicit dashboard opt-in authorizes future automatic requests.
+Do not enable this feature as part of installation, account import, repair or a
+general request to optimize quotas. Do not mint a GUI session, modify the saved
+consent fields, or call Claude directly to bypass a `session_required` refusal
+from `PUT /api/oauth/accounts/warmup`. Explain the setting and let the user enable
+it in the dashboard. Authenticated administrators can disable it to stop future
+attempts; disabling cannot undo a request already dispatched.
+
+`GET /api/oauth/accounts/warmup` reports local settings and status without sending
+inference or refreshing credentials. Do not interpret an unconfirmed window as
+permission to repeatedly send messages. The worker waits on provider-reported
+reset times, stays on the opted-in account and respects account restrictions.
+
 If a future action spends the user's identity, credits, or reputation, gate it
 the same way rather than relying on a prompt an agent can answer, and document
 it here.

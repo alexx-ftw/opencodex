@@ -99,9 +99,10 @@ The dashboard lists the conditions the pool is meant for: subscriptions you own 
 to use, the genuine Claude Code client, and a person supervising the session. Anthropic has not
 endorsed automated account pooling, accounts in one organization may share a quota (so another
 account may not add capacity), and switching accounts does not protect against provider
-enforcement. OpenCodex sends no keep-warm requests and, by default, neither refreshes Claude tokens
-nor reads usage in the background: usage is read when the dashboard, the menu bar app, or an `ocx`
-command asks for it. Thresholds are selection preferences, not usage or billing caps. This is
+enforcement. By default OpenCodex sends no keep-warm requests, refreshes no Claude tokens and
+reads no usage in the background: usage is read when the dashboard, the menu bar app, or an `ocx`
+command asks for it. The separately opted-in [five-hour window activation](#automatic-five-hour-window-activation)
+is an exception for selected accounts. Thresholds are selection preferences, not usage or billing caps. This is
 product guidance, not legal advice; check Anthropic's current terms.
 
 To bind a model to particular stored Claude accounts, add ordered `anthropicAccountPool.routes` rules while the pool is enabled. Each rule has a safe `name`, a full case-sensitive `match` glob, an `accounts` array of stored account IDs, and optional `fallback` (default `false`). The first matching rule limits active, manual, affinity, strategy and 429 recovery picks to its accounts. A healthy affinity outside that rule is ignored for this request but kept for other models; the routed choice does not overwrite it. Without fallback, an empty route returns a local 401, or 429 with `Retry-After` when all its declared accounts are cooling, before contacting Anthropic. The client response does not name the route; the proxy log records `route:#<n>`, where `n` is the rule’s 1-based position. `fallback: true` uses the ordinary pool only when the route has no eligible account, including its ordinary fill-first successor order; if its stored accounts are all cooling, the returned 429 uses the earliest cooldown across that expanded pool, even if a saved route account has been removed. An unmatched model follows the existing pool policy; disabling the pool leaves saved rules inactive and restores active-account and presence-driven 429 behavior. A rule is an operator allowlist, not proof of model entitlement.
@@ -145,6 +146,39 @@ Operational contract when enabled:
   `round-robin`. `fill-first` evaluates its drain threshold in the selected window.
 
 See [Configuration](/reference/configuration/providers/#anthropicaccountpool-experimental).
+
+### Automatic five-hour window activation
+
+In **Providers → Anthropic** (or **Anthropic 2**) **→ Accounts**, **Claude quota warm-up** is a separate,
+experimental, default-off control for automatic five-hour window activation. Enable it only for accounts you
+want OpenCodex to use in the background. It works with a single account and does not require
+account pooling to be enabled. Newly added or replaced logins are not opted in automatically.
+
+Once a finite five-hour reset time is known, OpenCodex waits for that provider-reported deadline,
+then sends a small message through that exact account. This is not a blind timer started at
+installation or a message to every account every five hours. The proxy must remain running;
+sleep, shutdown, network failures or account restrictions can delay or prevent activation.
+An account without a reported finite five-hour window cannot enable this feature.
+If the control is unavailable, refresh the account's usage in the dashboard first.
+If your plan has finite five-hour limits but no window has been observed yet, use Claude normally
+and refresh usage again. Plans without a finite five-hour meter are not supported.
+
+The request consumes subscription usage, including weekly usage. It does not raise limits,
+reset the weekly allowance, or bypass provider restrictions. Paused accounts, accounts requiring
+a new login, unknown or exhausted weekly quotas and cooldowns block dispatch. The feature does not
+silently switch to another account. Only a newly observed five-hour reset confirms activation;
+a successful message alone is not proof that Anthropic started a new window. If confirmation is
+missing, the dashboard reports that state instead of claiming success.
+
+Each attempted reset is recorded before the message is sent and is not automatically retried,
+even after a restart or an ambiguous network failure. This avoids duplicate background usage,
+but a failed attempt can leave the window inactive. A later observed finite window allows
+scheduling to continue. Turning the setting off and back on does not clear that attempt record.
+
+Enabling requires your dashboard session and explicit opt-in. Turning it off stops future
+automatic attempts; it cannot undo a request already sent. Review Anthropic's current terms
+before enabling automated use. See the
+[configuration reference](/reference/configuration/providers/#anthropicaccountpool-experimental).
 
 ### Native Messages with account pooling
 
